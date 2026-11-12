@@ -66,9 +66,9 @@ julia --project=. scripts/train.jl
 
 `forward.jl` and `train.jl` share `model.jl`; set `ATLANTIC_INPUT` and `ATLANTIC_OUTPUT` to override their directories. Output directories must be empty. `ATLANTIC_NX` defaults to 128; the horizontal spacing is always 100 m. The 12.8 km periodic domain is an inexpensive starting candidate, **not an established minimum or representation of all mesoscale weather**. The vertical grid has 25 m cells below 2.5 km and 100 m above, to 8 km (155 cells). The upper 20% damps velocity. Domain-size sensitivity remains necessary.
 
-The model uses P3 with the adapter's prognostic `aer2` aerosol distribution, ecCKD, Smagorinsky closure, interactive ocean fluxes driven by ERA5 SST, and a fixed 1 s timestep. There is no LASSO diagnostic aerosol-reservoir reset: aerosol evolves prognostically. The aerosol distribution is an initial assumption, not a fit to March CCN observations. Float64 is used for finite-difference sensitivity. The pinned Breeze example helpers supply physical operators; its July input files and its `build_case` function are not used.
+The model uses P3 with prognostic aerosol using the LASSO `aer1` lognormal modes (`ATLANTIC_AEROSOL`; `aer2` was the July 2017 choice). March 4 UHSAS surface N(D>60 nm) is 120–165 cm⁻³ over the interval; `aer1` gives ≈144 cm⁻³ in that range, `aer2` about twice as much. This is a consistency check of the size-distribution assumption, not a fit or CCN closure. The model also uses ecCKD, Smagorinsky closure, interactive ocean fluxes driven by ERA5 SST, and a fixed 1 s timestep. There is no LASSO diagnostic aerosol-reservoir reset: aerosol evolves prognostically. The aerosol distribution is an initial assumption, not a fit to March CCN observations. Float64 is used for finite-difference sensitivity. The pinned Breeze example helpers supply physical operators; its July input files and its `build_case` function are not used.
 
-Preparation preserves raw inputs and records checksums. It averages sonde measurements over 50 m windows, retaining the observed inversion, and derives humidity from dewpoint. It does not artificially homogenize the free troposphere. Initialization is condensate-free; a one-hour spin-up exclusion is explicit. ERA5 horizontal advection is calculated on pressure surfaces: theta advection is converted to a temperature tendency with Exner before the energy forcing is applied. Subsidence is separate, avoiding double counting. Geostrophic winds come from geopotential gradients. This initial estimate uses the nearest ERA5 column and central horizontal differences; it is not optimized using the final sounding.
+Preparation preserves raw inputs and records checksums. It averages sonde measurements over 50 m windows, retaining the observed inversion, and derives humidity from dewpoint. It does not artificially homogenize the free troposphere. Initialization is condensate-free; a one-hour spin-up exclusion is explicit. ERA5 horizontal advection is calculated on pressure surfaces: theta advection is converted to a temperature tendency with Exner before the energy forcing is applied. Subsidence is separate, avoiding double counting. Below the lowest ERA5 pressure level (≈190 m), advection and geostrophic wind hold their lowest value, and w tapers linearly to zero at the surface. Geostrophic winds come from geopotential gradients. This initial estimate uses the nearest ERA5 column and central horizontal differences; it is not optimized using the final sounding.
 
 ### Evaluation and training
 
@@ -80,23 +80,31 @@ The forward script saves LWP, final profiles, run settings, and `observation_err
 
 These are explicit balancing scales, not asserted observational uncertainties. LWP requires good `qc_phys_lwp`, good `phys_qc_flag`, convergence, at least 10 valid samples and at least 50% valid coverage per bin. Missing bins are omitted, never filled with zero. Sonde ascent time and point-versus-domain sampling remain comparison limitations. Training performance on this interval is not out-of-sample validation.
 
-The initial training script uses **central finite differences and backtracking**, not automatic differentiation. It fits two vertically tapered corrections: temperature advection in K/day and vapor advection in g/kg/day, bounded by ±3 and ±2 respectively. Each evaluation rebuilds the same model and deterministic perturbations. It defaults to one optimization iteration (`ATLANTIC_TRAIN_ITERATIONS`), accepts only a lower loss, and saves every evaluation and the fitted controls. This conservative baseline can later be replaced with a validated adjoint without changing the observation loss. It does not fit microphysics yet.
+The initial training script uses **central finite differences and backtracking**, not automatic differentiation. It fits two vertically tapered corrections: temperature advection in K/day and vapor advection in g/kg/day, bounded by ±3 and ±2 respectively and normalized by those bounds. Central-difference half-steps are 1 K/day and 0.5 g/kg/day, which are large enough to exceed the sensitivity of a chaotic LES to tiny perturbations. A steepest-descent step (trust radius 0.5 in normalized units) is backtracked once. `ATLANTIC_BASELINE` reuses a completed uncorrected forward run. `ATLANTIC_BUDGET_SECONDS` (default 23 h) prevents starting an evaluation that cannot finish. One iteration therefore costs 4–6 forward runs. Every evaluation, its wall time, and the fitted controls are saved. This conservative baseline can later be replaced with a validated adjoint without changing the observation loss. It does not fit microphysics yet.
 
 ### GCP
 
-From a dedicated checkout after instantiating its Julia environment:
+Jobs read scripts at runtime, so submit from a frozen detached worktree per commit. `gcp.sbatch` refuses a modified tree and records the commit:
+
+```sh
+git worktree add --detach ~/AtlanticBreeze-runs/$(git rev-parse --short HEAD) HEAD
+cd ~/AtlanticBreeze-runs/<sha>
+export ATLANTIC_OUTPUT=/path/outside/repo/new-directory
+```
+
+Then:
 
 ```sh
 export ATLANTIC_INPUT=/path/to/prepared/interval
 # Engineering test at the intended horizontal grid; not an observation comparison.
-ATLANTIC_STOP_SECONDS=2 sbatch scripts/gcp.sbatch forward
+ATLANTIC_STOP_SECONDS=600 sbatch --time=01:00:00 scripts/gcp.sbatch forward
 # Full interval:
 sbatch scripts/gcp.sbatch forward
 # Training costs several full forward evaluations:
 sbatch --job-name=atlantic-train scripts/gcp.sbatch train
 ```
 
-`ATLANTIC_CPU=true ATLANTIC_NX=8 ATLANTIC_STOP_SECONDS=2` provides a small CPU engineering test. Such tests deliberately report no final-sounding loss. No restart/pickup support is claimed yet; interrupted trials should use a fresh output directory. Scheduler logs remain outside Git.
+`ATLANTIC_CPU=true ATLANTIC_NX=8 ATLANTIC_STOP_SECONDS=2` provides a small CPU engineering test. Such tests deliberately report no final-sounding loss. No restart/pickup support is claimed yet. `lwp.csv` (with max |u|, max |w|, CFL, and wall time) is rewritten every simulated minute, and `run.toml` says `complete_interval = false` until the end is reached. Runs stop if CFL exceeds 0.8. Scheduler logs remain outside Git.
 
 ### Current validation
 

@@ -9,7 +9,8 @@ include(joinpath(pkgdir(Breeze), "examples", "lasso_ena", "LassoENA.jl"))
 const L = LassoENA
 readcsv(path) = readdlm(path, ',', Float64; skipstart=1)
 
-function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU())
+# aer1 matches March 4 surface UHSAS N(D>60 nm) ≈ 120–165 cm⁻³; LASSO aer2 is about twice that.
+function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1)
     config = TOML.parsefile(joinpath(input, "interval.toml"))
     isnothing(nx) && (nx = config["nx"])
     Oceananigans.defaults.FloatType = Float64
@@ -25,7 +26,7 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU())
     reference = L.sounding_reference_state(grid, profiles, constants)
     pressure = Array(interior(reference.pressure, 1, 1, :))
     density = Array(interior(reference.density, 1, 1, :))
-    aerosol = L.lasso_aerosol(; reference_density=density[1], maximum_supersaturation=0.003)
+    aerosol = L.lasso_aerosol(; setting=aerosol_setting, reference_density=density[1], maximum_supersaturation=0.003)
     microphysics = P3Microphysics(; cloud=L.CloudDroplets(; number_concentration=75e6), aerosol)
     # Controls: added dT/dt [K/day] and dq/dt [g/kg/day], tapered out by 2500 m.
     taper = clamp.((2500 .- z)./1000, 0, 1)
@@ -73,48 +74,69 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU())
     return (;model,config,z,faces,pressure,refresh!)
 end
 
-function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothing, cpu=false)
+function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothing, cpu=false,
+                  aerosol_setting=Symbol(get(ENV,"ATLANTIC_AEROSOL","aer1")))
     isdir(output) && !isempty(readdir(output)) && error("Output directory is not empty: $output")
     mkpath(output)
-    case=make_case(input;controls,nx,architecture=cpu ? CPU() : GPU())
+    wall0=time()
+    case=make_case(input;controls,nx,architecture=cpu ? CPU() : GPU(),aerosol_setting)
     model=case.model; config=case.config
     duration=isnothing(stop_time) ? config["duration"] : min(stop_time,config["duration"])
+    meta=Dict{String,Any}("duration"=>duration,"complete_interval"=>false,"loss"=>NaN,
+        "temperature_correction_Kday"=>controls[1],"moisture_correction_gkgday"=>controls[2],"nx"=>size(model.grid,1),
+        "input"=>abspath(input),"precision"=>"Float64","aerosol"=>"prognostic","aerosol_setting"=>string(aerosol_setting),
+        "dt"=>config["dt"],"commit"=>get(ENV,"ATLANTIC_COMMIT","unknown"))
+    writemeta()=open(io->TOML.print(io,meta),joinpath(output,"run.toml"),"w")
+    writemeta()  # Records an incomplete run until the end is reached.
     simulation=Simulation(model;Δt=config["dt"],stop_time=duration)
     add_callback!(simulation,case.refresh!,IterationInterval(1))
     records=Vector{Float64}[]
+    header=["time_s" "LWP_gm2" "max_abs_u_ms" "max_abs_w_ms" "cfl" "wall_s"]
+    Δzmin=minimum(diff(case.faces))
     function diagnose(sim)
         m=sim.model; water=m.microphysical_fields
         # Total P3 liquid includes rain and liquid coating on ice.
         liquid=Array(interior(water.ρqᶜˡ))+Array(interior(water.ρqʳ))+Array(interior(water.ρqʷⁱ))
         lwp=1000sum(vec(mean(liquid;dims=(1,2))).*diff(case.faces))
-        isfinite(lwp) || error("Nonfinite LWP")
-        push!(records,[m.clock.time,lwp]); @info "forward" time=m.clock.time lwp
+        U=max(maximum(abs,interior(m.velocities.u)),maximum(abs,interior(m.velocities.v)))
+        W=maximum(abs,interior(m.velocities.w))
+        cfl=config["dt"]*(2U/100+W/Δzmin)
+        row=[m.clock.time,lwp,U,W,cfl,time()-wall0]
+        all(isfinite,row) || error("Nonfinite diagnostics at t=$(m.clock.time)")
+        cfl<0.8 || error("CFL $(cfl) exceeds 0.8 at t=$(m.clock.time)")
+        push!(records,row); @info "forward" time=m.clock.time lwp W cfl wall=row[end]
+        # Rewritten every minute: an interrupted run keeps its history (no restart is claimed).
+        writedlm(joinpath(output,"lwp.csv"),vcat(header,reduce(vcat,permutedims.(records))),',')
     end
     add_callback!(simulation,diagnose,TimeInterval(60))
     run!(simulation)
     (isempty(records) || last(records)[1]!=model.clock.time) && diagnose(simulation)
-    result=reduce(vcat,permutedims.(records));writedlm(joinpath(output,"lwp.csv"),vcat(["time_s" "LWP_gm2"],result),',')
+    result=reduce(vcat,permutedims.(records))
     average(field)=vec(mean(Array(interior(field));dims=(1,2)))
     theta=average(model.temperature).*(1e5./case.pressure).^0.2857
     final=hcat(case.z,theta,average(model.microphysical_fields.qᵛ),average(model.velocities.u),average(model.velocities.v))
     all(isfinite,final) || error("Nonfinite final profile")
     writedlm(joinpath(output,"final.csv"),vcat(["z_m" "theta_d_K" "qv_kgkg" "u_ms" "v_ms"],final),',')
-    loss=NaN
-    if duration==config["duration"]
-        obs=readcsv(joinpath(input,"lwp.csv")); errors=Float64[]
-        for row in eachrow(obs)
-            row[1]>=config["spinup"] && isfinite(row[3]) || continue
-            select=(result[:,1].>=row[1]).&(result[:,1].<row[2])
-            any(select) && push!(errors,((mean(result[select,2])-row[3])/50)^2)
-        end
-        isempty(errors) && error("No post-spinup valid LWP comparison bins")
-        target=readcsv(joinpath(input,"target.csv")); keep=case.z.<=2500
-        loss=mean(errors)+mean((final[keep,2]-target[keep,3]).^2)+mean(((final[keep,3]-target[keep,4])./.001).^2)
+    complete=model.clock.time>=config["duration"]-config["dt"]/2
+    if complete
+        terms=observation_loss(input,config,result,final,case.z)
+        meta["loss_terms"]=terms; meta["loss"]=terms["lwp"]+terms["theta"]+terms["qv"]
     end
-    open(joinpath(output,"run.toml"),"w") do io
-        TOML.print(io,Dict("duration"=>duration,"complete_interval"=>duration==config["duration"],"loss"=>loss,
-            "temperature_correction_Kday"=>controls[1],"moisture_correction_gkgday"=>controls[2],"nx"=>size(model.grid,1),
-            "input"=>abspath(input),"precision"=>"Float64","aerosol"=>"prognostic"))
+    meta["complete_interval"]=complete; meta["wall_seconds"]=time()-wall0; meta["final_time"]=model.clock.time
+    writemeta()
+    return meta["loss"]
+end
+
+# Balancing scales (50 g m⁻², 1 K, 1 g kg⁻¹), not observational error bars.
+function observation_loss(input,config,result,final,z)
+    obs=readcsv(joinpath(input,"lwp.csv")); errors=Float64[]
+    for row in eachrow(obs)
+        row[1]>=config["spinup"] && isfinite(row[3]) || continue
+        select=(result[:,1].>=row[1]).&(result[:,1].<row[2])
+        any(select) && push!(errors,((mean(result[select,2])-row[3])/50)^2)
     end
-    return loss
+    isempty(errors) && error("No post-spinup valid LWP comparison bins")
+    target=readcsv(joinpath(input,"target.csv")); keep=z.<=2500
+    return Dict("lwp"=>mean(errors),"theta"=>mean((final[keep,2]-target[keep,3]).^2),
+                "qv"=>mean(((final[keep,3]-target[keep,4])./.001).^2))
 end

@@ -13,7 +13,8 @@ end
 times=unique(forcing[:,1]);z=a[:,1];nt=length(times)
 for (slot,col,label,scale) in [(1,3,"ERA5 thermal advection (K day⁻¹)",86400),(2,4,"ERA5 moisture advection (g kg⁻¹ day⁻¹)",86400*1000)]
  ax=Axis(f[2,slot],xlabel="Hours since initial sounding",ylabel="Height (km)",title=label)
- h=heatmap!(ax,times/3600,z/1000,permutedims(reshape(forcing[:,col]*scale,length(z),nt)),colormap=:balance)
+ data=permutedims(reshape(forcing[:,col]*scale,length(z),nt));m=maximum(abs,data[:,z.<=3000])
+ h=heatmap!(ax,times/3600,z/1000,data,colormap=:balance,colorrange=(-m,m))
  ylims!(ax,0,3);Colorbar(f[2,slot,Right()],h)
 end
 ax=Axis(f[2,3],xlabel="Hours since initial sounding",ylabel="LWP (g m⁻²)",title="QC-screened MWRRET observations")

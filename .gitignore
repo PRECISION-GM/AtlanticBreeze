@@ -1,0 +1,10 @@
+/data/
+/outputs/
+*.part
+*.cookies
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.DS_Store

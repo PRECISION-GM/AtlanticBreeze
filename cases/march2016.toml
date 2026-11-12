@@ -1,0 +1,6 @@
+# Dates are inclusive, UTC. Area order: north, west, south, east.
+start = 2016-02-26
+end = 2016-03-11
+focus = 2016-03-04
+area = [42, -31, 36, -25]
+paper = "https://doi.org/10.1029/2018JD030141"

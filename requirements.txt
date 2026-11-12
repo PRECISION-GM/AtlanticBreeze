@@ -1,0 +1,5 @@
+# Python >= 3.11; used only for data acquisition and inspection.
+cdsapi
+requests
+netCDF4
+numpy

@@ -1,0 +1,14 @@
+[deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+Breeze = "660aa2fb-d4c8-4359-a52c-9c057bc511da"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+NCDatasets = "85f8d34a-cbdd-5861-8df4-14fed0d494ab"
+NumericalRadiation = "cd8119b0-1744-44d6-9ede-6ad1ad750b26"
+Oceananigans = "9e8cae18-63c1-5223-a75c-80ca9d6e9a09"
+
+[sources]
+Breeze = {url = "https://github.com/NumericalEarth/Breeze.jl.git", rev = "ded92c9d0097e7f6f653e7326358a38a0f9e2f19"}
+
+[compat]
+julia = "1.12"

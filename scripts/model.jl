@@ -19,7 +19,7 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
     forcing_data = readcsv(joinpath(input, "forcing.csv"))
     z = initial[:, 1]; nz = length(z); times = unique(forcing_data[:, 1])
     grid = RectilinearGrid(architecture, Float64; size=(nx, nx, nz), x=(0, nx*100), y=(0, nx*100),
-                          z=faces, halo=(5, 5, 5), topology=(Periodic, Periodic, Bounded))
+                          z=faces, halo=(6, 6, 5), topology=(Periodic, Periodic, Bounded))  # minimum halo Oceananigans requires for this WENO9 setup
     constants = Breeze.ThermodynamicConstants(Float64)
     profiles = L.SoundingProfiles(z, initial[:,3], initial[:,4], initial[:,5], initial[:,6],
                                   initial[1,2]*exp(9.80665*z[1]/(287.05*initial[1,3]*(initial[1,2]/1e5)^0.2857)), false)
@@ -56,11 +56,14 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         background_atmosphere=BackgroundAtmosphere(CO₂=405e-6,CH₄=1.85e-6,N₂O=330e-9),
         solar_position=ApparentSolarPosition(;coordinate=(-28.0257,39.0916),epoch=DateTime(config["epoch"])),
         schedule=IterationInterval(30),liquid_effective_radius=ConstantRadiusParticles(14e-6),
-        ice_effective_radius=ConstantRadiusParticles(30e-6))
+        ice_effective_radius=ConstantRadiusParticles(30e-6),
+        # Radiation sees a continued column above the 8 km LES top: 40 layers to 65 km, standard-atmosphere
+        # T/q anchored to the grid-top temperature, and the background standard ozone profile.
+        overlying_atmosphere=OverlyingAtmosphereColumn(Float64; top=65e3, layers=40))
     model=AtmosphereModel(grid; dynamics=AnelasticDynamics(reference),formulation=:LiquidIcePotentialTemperature,
         microphysics,radiation,forcing=L.compact_forcing(forcing),boundary_conditions,thermodynamic_constants=constants,
-        coriolis=FPlane(f=9.19626e-5),closure=SmagorinskyLilly(),momentum_advection=WENO(order=5),
-        scalar_advection=L.scalar_advection_schemes(5,microphysics,:qᵛ))
+        coriolis=FPlane(f=9.19626e-5),closure=nothing,momentum_advection=WENO(order=9),
+        scalar_advection=L.scalar_advection_schemes(9,microphysics,:qᵛ))
     state=L.initial_state_columns(profiles,z,pressure;constants)
     # The observations are dry theta, not Breeze liquid-ice theta. Initialize via T.
     state=merge(state,(;T_condensate_free=initial[:,3].*(pressure./1e5).^0.2857))
@@ -85,7 +88,7 @@ function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothin
     meta=Dict{String,Any}("duration"=>duration,"complete_interval"=>false,"loss"=>NaN,
         "temperature_correction_Kday"=>controls[1],"moisture_correction_gkgday"=>controls[2],"nx"=>size(model.grid,1),
         "input"=>abspath(input),"precision"=>"Float64","aerosol"=>"prognostic","aerosol_setting"=>string(aerosol_setting),
-        "dt"=>config["dt"],"commit"=>get(ENV,"ATLANTIC_COMMIT","unknown"))
+        "dt"=>config["dt"],"advection"=>"WENO9 momentum and scalars","closure"=>"none (implicit WENO dissipation)","commit"=>get(ENV,"ATLANTIC_COMMIT","unknown"))
     writemeta()=open(io->TOML.print(io,meta),joinpath(output,"run.toml"),"w")
     writemeta()  # Records an incomplete run until the end is reached.
     simulation=Simulation(model;Δt=config["dt"],stop_time=duration)

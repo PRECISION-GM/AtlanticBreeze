@@ -18,7 +18,7 @@ const TAPER_TOP = 2500.0
 const ENA_COORDINATE = (-28.0257, 39.0916)  # (longitude, latitude) of the ARM ENA site
 
 function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1,
-                   order=advection_order(), dx=grid_spacing(), solar_position=nothing)
+                   order=advection_order(), dx=grid_spacing(), solar_position=nothing, lookup_search=nothing)
     config = TOML.parsefile(joinpath(input, "interval.toml"))
     isnothing(nx) && (nx = config["nx"])
     Oceananigans.defaults.FloatType = Float64
@@ -63,7 +63,7 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
     surface_density=L.sam_surface_interface_density(pressure,z,constants.gravitational_acceleration)
     boundary_conditions=L.sam_ocean_surface_flux_boundary_conditions(grid,surface_temperature;
         moisture_name=:qᵛ,microphysics,thermodynamic_constants=constants,surface_density)
-    radiation=RadiativeTransferModel(grid,EcCKDOptics(; clouds=CloudScatteringTables()),constants;
+    radiation=RadiativeTransferModel(grid,EcCKDOptics(; clouds=CloudScatteringTables(), lookup_search),constants;
         surface_temperature,surface_albedo=0.07,surface_emissivity=0.95,
         background_atmosphere=BackgroundAtmosphere(CO₂=405e-6,CH₄=1.85e-6,N₂O=330e-9),
         # The gradient check passes a FixedCosineZenith: ApparentSolarPosition builds a DateTime from the clock,

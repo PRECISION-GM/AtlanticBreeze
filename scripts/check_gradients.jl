@@ -53,7 +53,10 @@ epoch = DateTime(TOML.parsefile(joinpath(input, "interval.toml"))["epoch"])
 cos_zenith = max(Breeze.AtmosphereModels.cos_solar_zenith_angle(
     Breeze.AtmosphereModels.compute_datetime(saved.time, epoch), ENA_COORDINATE...), 0.0)
 solar_position = FixedCosineZenith(cos_zenith)
-native = make_case(input; nx, dx, order, architecture=GPU(), solar_position)
+# Gas-optics table brackets without a data-dependent loop exit (same brackets as the default binary
+# search), which Reactant needs to raise the radiation kernels.
+lookup_search = NumericalRadiation.FixedBinarySearch()
+native = make_case(input; nx, dx, order, architecture=GPU(), solar_position, lookup_search)
 model = native.model; Nz = length(native.z)
 
 # Window inputs, all on the architecture of the model they are used with (no host reads while traced).
@@ -127,7 +130,7 @@ fd = [(k, ε, (J([k == 1 ? ε : 0, k == 2 ? ε : 0]) - J([k == 1 ? -ε : 0, k ==
 # Construction runs eager operations on concrete Reactant arrays (e.g. the SAM sponge's initial horizontal
 # average), which index element by element. Scalar access is allowed for construction only; the compiled
 # programs below trace these operations instead.
-rcase = with_large_stack(() -> CUDA.@allowscalar make_case(input; nx, dx, order, architecture=ReactantState(), solar_position))
+rcase = with_large_stack(() -> CUDA.@allowscalar make_case(input; nx, dx, order, architecture=ReactantState(), solar_position, lookup_search))
 rmodel = rcase.model
 set!(rmodel.radiation.surface_radiation.surface_temperature, saved.sst)
 rinputs = window_inputs(ReactantState())
@@ -160,7 +163,7 @@ results = Dict("scope" => "pathwise derivative of a $(steps)-step window from a 
     "objective" => "LWP/(50 g m-2) + vapor path below 2.5 km/(1 kg m-2), domain mean, end of window",
     "controls" => "normalized: x1*3 K/day, x2*2 g/kg/day, tapered to zero at 2.5 km",
     "spunup_time_s" => saved.time, "cos_zenith_fixed" => cos_zenith,
-    "solar_position" => "fixed at window start (traced DateTime unsupported)", "start_lwp_gm2" => cloud_lwp, "sst_K" => saved.sst,
+    "solar_position" => "fixed at window start (traced DateTime unsupported)", "lookup_search" => "FixedBinarySearch", "start_lwp_gm2" => cloud_lwp, "sst_K" => saved.sst,
     "J_native" => J0, "J_native_repeat" => J0_repeat, "J_compiled" => Jc, "J_gradient_primal" => Jg, "primal_parity" => parity,
     "gradient" => g, "best_relative_error" => best, "native_window_seconds" => native_seconds,
     "primal_compile_seconds" => primal_compile, "gradient_compile_seconds" => gradient_compile,

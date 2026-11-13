@@ -16,6 +16,9 @@ export JULIA_CUDA_USE_COMPAT=false JULIA_NUM_THREADS=8 JULIA_NUM_PRECOMPILE_TASK
 unset LD_LIBRARY_PATH
 : "${ATLANTIC_INPUT:?Set ATLANTIC_INPUT to the prepared interval directory}"
 : "${ATLANTIC_OUTPUT:?Set ATLANTIC_OUTPUT to a new directory outside the repository}"
+# Spot preemption requeues the job: each attempt gets its own directory so partial output is kept
+# and a restart never collides with it (the cause of the 15027 failure).
+export ATLANTIC_OUTPUT="$ATLANTIC_OUTPUT/attempt-${SLURM_RESTART_COUNT:-0}"
 echo "commit $ATLANTIC_COMMIT input $ATLANTIC_INPUT output $ATLANTIC_OUTPUT"
 sha256sum scripts/*.jl Project.toml Manifest.toml "$ATLANTIC_INPUT"/*.csv
 mode="${1:-forward}"

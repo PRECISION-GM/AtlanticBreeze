@@ -115,7 +115,10 @@ note("native primal"; J0, J0_repeat, cloud_lwp_gm2=cloud_lwp, native_seconds)
 cloud_lwp > 1 || error("Window starts from a nearly cloud-free state (LWP $(cloud_lwp) g/m²); spin up longer")
 fd = [(k, ε, (J([k == 1 ? ε : 0, k == 2 ? ε : 0]) - J([k == 1 ? -ε : 0, k == 2 ? -ε : 0])) / 2ε) for k in 1:2, ε in epsilons]
 
-rcase = with_large_stack(() -> make_case(input; nx, dx, order, architecture=ReactantState()))
+# Construction runs eager operations on concrete Reactant arrays (e.g. the SAM sponge's initial horizontal
+# average), which index element by element. Scalar access is allowed for construction only; the compiled
+# programs below trace these operations instead.
+rcase = with_large_stack(() -> CUDA.@allowscalar make_case(input; nx, dx, order, architecture=ReactantState()))
 rmodel = rcase.model
 set!(rmodel.radiation.surface_radiation.surface_temperature, saved.sst)
 rinputs = window_inputs(ReactantState())

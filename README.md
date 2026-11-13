@@ -109,3 +109,19 @@ sbatch --job-name=atlantic-train scripts/gcp.sbatch train
 ### Current validation
 
 Input extraction and the Julia observation/forcing plot have been exercised on the March 4 data. An 8² CPU engineering test advanced two timesteps with finite LWP and final profiles. The optimizer control flow passed a synthetic quadratic check; this is not a physical gradient test. The 128² GPU smoke test and full-interval validation are still pending GPU capacity. No trained LES result is claimed yet.
+
+### Gradient check (Reactant/Enzyme)
+
+`scripts/check_gradients.jl` runs in the `gradient/` project (the forward Manifest plus Reactant and Enzyme; physics packages identical). It differentiates a short window from a spun-up cloudy state with respect to the two training controls. Those controls are a separate, model-owned correction forcing, so a compiled program sets them from traced values. Each evaluation restores every prognostic field and resets the clock to iteration 0, so radiation is recomputed from the restored state and then every 30 steps. SST is held at its spun-up value within a window.
+
+The objective is end-of-window LWP/(50 g m⁻²) plus vapor path below 2.5 km/(1 kg m⁻²). The script compares:
+
+- native CUDA primal against compiled primal (parity), and
+- the Enzyme reverse gradient against native central differences over an ε sweep.
+
+It saves `gradients.toml` (configuration, versions, GPU, compile/run times, memory) and `fd.csv`. `ATLANTIC_NX`, `ATLANTIC_DX`, `ATLANTIC_ORDER` (9 or the WENO5 fallback) and `ATLANTIC_WINDOW_STEPS` select the configuration. A pass is evidence for that grid and window only. It does not validate the derivative of the 12 h objective.
+
+```sh
+ATLANTIC_NX=16 ATLANTIC_DX=200 ATLANTIC_WINDOW_STEPS=3 ATLANTIC_TIMEOUT=90m \
+  ATLANTIC_OUTPUT=/new/dir sbatch --time=02:00:00 --job-name=atlantic-gradient scripts/gcp.sbatch check_gradients
+```

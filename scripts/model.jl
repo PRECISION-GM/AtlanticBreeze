@@ -10,7 +10,14 @@ const L = LassoENA
 readcsv(path) = readdlm(path, ',', Float64; skipstart=1)
 
 # aer1 matches March 4 surface UHSAS N(D>60 nm) ≈ 120–165 cm⁻³; LASSO aer2 is about twice that.
-function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1)
+advection_order() = parse(Int, get(ENV, "ATLANTIC_ORDER", "9"))   # 9 default; 5 is the authorized fallback
+grid_spacing() = parse(Float64, get(ENV, "ATLANTIC_DX", "100"))
+# Minimum halos Oceananigans accepted for these schemes (WENO9 rejects (5,5,5)).
+advection_halo(order) = order == 9 ? (6, 6, 5) : order == 5 ? (5, 5, 5) : error("ATLANTIC_ORDER must be 5 or 9")
+const TAPER_TOP = 2500.0
+
+function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1,
+                   order=advection_order(), dx=grid_spacing())
     config = TOML.parsefile(joinpath(input, "interval.toml"))
     isnothing(nx) && (nx = config["nx"])
     Oceananigans.defaults.FloatType = Float64
@@ -18,8 +25,8 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
     initial = readcsv(joinpath(input, "initial.csv"))
     forcing_data = readcsv(joinpath(input, "forcing.csv"))
     z = initial[:, 1]; nz = length(z); times = unique(forcing_data[:, 1])
-    grid = RectilinearGrid(architecture, Float64; size=(nx, nx, nz), x=(0, nx*100), y=(0, nx*100),
-                          z=faces, halo=(6, 6, 5), topology=(Periodic, Periodic, Bounded))  # minimum halo Oceananigans requires for this WENO9 setup
+    grid = RectilinearGrid(architecture, Float64; size=(nx, nx, nz), x=(0, nx*dx), y=(0, nx*dx),
+                          z=faces, halo=advection_halo(order), topology=(Periodic, Periodic, Bounded))
     constants = Breeze.ThermodynamicConstants(Float64)
     profiles = L.SoundingProfiles(z, initial[:,3], initial[:,4], initial[:,5], initial[:,6],
                                   initial[1,2]*exp(9.80665*z[1]/(287.05*initial[1,3]*(initial[1,2]/1e5)^0.2857)), false)
@@ -28,22 +35,26 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
     density = Array(interior(reference.density, 1, 1, :))
     aerosol = L.lasso_aerosol(; setting=aerosol_setting, reference_density=density[1], maximum_supersaturation=0.003)
     microphysics = P3Microphysics(; cloud=L.CloudDroplets(; number_concentration=75e6), aerosol)
-    # Controls: added dT/dt [K/day] and dq/dt [g/kg/day], tapered out by 2500 m.
-    taper = clamp.((2500 .- z)./1000, 0, 1)
     columns(c) = [forcing_data[forcing_data[:,1].==t,c] for t in times]
-    tcols = [c .+ controls[1].*taper./86400 for c in columns(3)]
-    qcols = [c .+ controls[2].*taper./(1000*86400) for c in columns(4)]
     series(c) = L.profile_time_series(grid,times,columns(c))
-    thermo = L.large_scale_thermodynamic_forcings(L.profile_time_series(grid,times,tcols),
-        L.profile_time_series(grid,times,qcols); microphysics, thermodynamic_constants=constants,
+    thermo = L.large_scale_thermodynamic_forcings(series(3), series(4); microphysics, thermodynamic_constants=constants,
         moisture_name=:qᵛ, moisture_basis=:mass_fraction)
+    # Controls: added dT/dt [K/day] and dq/dt [g/kg/day], tapered out by 2500 m. They are a separate,
+    # linear, time-constant forcing whose profiles the model owns, so a differentiated program can set
+    # them from traced controls (set_controls!) instead of baking them into the ERA5 series.
+    taper = clamp.((TAPER_TOP .- z)./1000, 0, 1)
+    knots = [-1e6, 1e6]
+    correction = L.large_scale_thermodynamic_forcings(
+        L.profile_time_series(grid,knots,fill(controls[1].*taper./86400,2)),
+        L.profile_time_series(grid,knots,fill(controls[2].*taper./(1000*86400),2));
+        microphysics, thermodynamic_constants=constants, moisture_name=:qᵛ, moisture_basis=:mass_fraction)
     geostrophic = L.time_varying_geostrophic_forcings(series(6),series(7))
     subsidence = L.LargeScaleVerticalAdvection(series(5))
     sponge = L.SAMSponge(; damping_depth_fraction=0.2)
     forcing = Dict{Symbol,Tuple}(:u=>(geostrophic.u,subsidence,sponge),
-        :v=>(geostrophic.v,subsidence,sponge), :w=>(sponge,), :E=>(thermo.E,), :θ=>(subsidence,))
+        :v=>(geostrophic.v,subsidence,sponge), :w=>(sponge,), :E=>(thermo.E,correction.E), :θ=>(subsidence,))
     for name in L.specific_prognostic_names(microphysics); forcing[name]=(subsidence,); end
-    forcing[:qᵛ]=(thermo.qᵛ,subsidence)
+    forcing[:qᵛ]=(thermo.qᵛ,subsidence,correction.qᵛ)  # correction last: see set_controls!
     sst_values=[first(c) for c in columns(8)]
     surface_temperature=Field{Center,Center,Nothing}(grid)
     set!(surface_temperature,L.interpolate_profile(times,sst_values,0))
@@ -62,8 +73,8 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         overlying_atmosphere=OverlyingAtmosphereColumn(Float64; top=65e3, layers=40))
     model=AtmosphereModel(grid; dynamics=AnelasticDynamics(reference),formulation=:LiquidIcePotentialTemperature,
         microphysics,radiation,forcing=L.compact_forcing(forcing),boundary_conditions,thermodynamic_constants=constants,
-        coriolis=FPlane(f=9.19626e-5),closure=nothing,momentum_advection=WENO(order=9),
-        scalar_advection=L.scalar_advection_schemes(9,microphysics,:qᵛ))
+        coriolis=FPlane(f=9.19626e-5),closure=nothing,momentum_advection=WENO(; order),
+        scalar_advection=L.scalar_advection_schemes(order,microphysics,:qᵛ))
     state=L.initial_state_columns(profiles,z,pressure;constants)
     # The observations are dry theta, not Breeze liquid-ice theta. Initialize via T.
     state=merge(state,(;T_condensate_free=initial[:,3].*(pressure./1e5).^0.2857))
@@ -74,7 +85,7 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         set!(surface_temperature,L.interpolate_profile(times,sst_values,sim.model.clock.time))
         fill_halo_regions!(surface_temperature)
     end
-    return (;model,config,z,faces,pressure,refresh!)
+    return (;model,config,z,faces,pressure,refresh!,taper,order,dx)
 end
 
 function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothing, cpu=false,
@@ -86,9 +97,9 @@ function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothin
     model=case.model; config=case.config
     duration=isnothing(stop_time) ? config["duration"] : min(stop_time,config["duration"])
     meta=Dict{String,Any}("duration"=>duration,"complete_interval"=>false,"loss"=>NaN,
-        "temperature_correction_Kday"=>controls[1],"moisture_correction_gkgday"=>controls[2],"nx"=>size(model.grid,1),
+        "temperature_correction_Kday"=>controls[1],"moisture_correction_gkgday"=>controls[2],"nx"=>size(model.grid,1),"dx_m"=>case.dx,"domain_m"=>size(model.grid,1)*case.dx,"order"=>case.order,"halo"=>collect(advection_halo(case.order)),
         "input"=>abspath(input),"precision"=>"Float64","aerosol"=>"prognostic","aerosol_setting"=>string(aerosol_setting),
-        "dt"=>config["dt"],"advection"=>"WENO9 momentum and scalars","closure"=>"none (implicit WENO dissipation)","commit"=>get(ENV,"ATLANTIC_COMMIT","unknown"))
+        "dt"=>config["dt"],"advection"=>"WENO$(case.order) momentum and scalars","closure"=>"none (implicit WENO dissipation)","commit"=>get(ENV,"ATLANTIC_COMMIT","unknown"))
     writemeta()=open(io->TOML.print(io,meta),joinpath(output,"run.toml"),"w")
     writemeta()  # Records an incomplete run until the end is reached.
     simulation=Simulation(model;Δt=config["dt"],stop_time=duration)
@@ -103,7 +114,7 @@ function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothin
         lwp=1000sum(vec(mean(liquid;dims=(1,2))).*diff(case.faces))
         U=max(maximum(abs,interior(m.velocities.u)),maximum(abs,interior(m.velocities.v)))
         W=maximum(abs,interior(m.velocities.w))
-        cfl=config["dt"]*(2U/100+W/Δzmin)
+        cfl=config["dt"]*(2U/case.dx+W/Δzmin)
         row=[m.clock.time,lwp,U,W,cfl,time()-wall0]
         all(isfinite,row) || error("Nonfinite diagnostics at t=$(m.clock.time)")
         cfl<0.8 || error("CFL $(cfl) exceeds 0.8 at t=$(m.clock.time)")

@@ -37,7 +37,8 @@ function train()
         # Reuse a completed uncorrected forward run of the same input and settings instead of repeating it.
         meta=TOML.parsefile(joinpath(baseline,"run.toml"))
         meta["complete_interval"] && meta["temperature_correction_Kday"]==0 && meta["moisture_correction_gkgday"]==0 &&
-            meta["input"]==abspath(input) && meta["nx"]==nx && meta["aerosol_setting"]==get(ENV,"ATLANTIC_AEROSOL","aer1") ||
+            meta["input"]==abspath(input) && meta["nx"]==nx && meta["aerosol_setting"]==get(ENV,"ATLANTIC_AEROSOL","aer1") &&
+            meta["order"]==advection_order() && meta["dx_m"]==grid_spacing() ||
             error("ATLANTIC_BASELINE is not a complete matching uncorrected run")
         loss=meta["loss"]; best=baseline; push!(costs,meta["wall_seconds"])
     end

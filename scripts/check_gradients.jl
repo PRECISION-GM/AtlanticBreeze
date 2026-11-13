@@ -30,22 +30,31 @@ mkpath(output)
 Reactant.set_default_backend("gpu")
 note(msg; kw...) = (@info msg kw...; flush(stderr))
 
-# Build the native case; spin up from the condensate-free sounding to a cloudy state (or load it).
-native = make_case(input; nx, dx, order, architecture=GPU())
-model = native.model
-Nz = length(native.z); hz = advection_halo(order)[3]
+# Spin up natively (true solar position) from the condensate-free sounding to a cloudy state, or load it.
+hz = advection_halo(order)[3]
 if isfile(state_file)
     saved = deserialize(state_file)
     (saved.nx, saved.dx, saved.order) == (nx, dx, order) || error("State file is for another configuration")
 else
-    simulation = Simulation(model; Δt=native.config["dt"], stop_time=spinup)
-    add_callback!(simulation, native.refresh!, IterationInterval(1))
+    spin_case = make_case(input; nx, dx, order, architecture=GPU())
+    simulation = Simulation(spin_case.model; Δt=spin_case.config["dt"], stop_time=spinup)
+    add_callback!(simulation, spin_case.refresh!, IterationInterval(1))
     spin = @elapsed run!(simulation)
-    saved = (; nx, dx, order, time=model.clock.time, spinup_wall=spin,
-               sst=Array(interior(model.radiation.surface_radiation.surface_temperature))[1],
-               fields=Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(model))))
+    saved = (; nx, dx, order, time=spin_case.model.clock.time, spinup_wall=spin,
+               sst=Array(interior(spin_case.model.radiation.surface_radiation.surface_temperature))[1],
+               fields=Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(spin_case.model))))
     serialize(state_file, saved)
 end
+
+# Window models (native and Reactant) hold cos(θz) at its value at the window start: ApparentSolarPosition
+# converts the clock to a DateTime, which cannot be traced. Near the spun-up time cos(θz) changes by
+# about 3e-5 per second here (0.007 over 240 s); the forward runs keep the time-varying sun.
+epoch = DateTime(TOML.parsefile(joinpath(input, "interval.toml"))["epoch"])
+cos_zenith = max(Breeze.AtmosphereModels.cos_solar_zenith_angle(
+    Breeze.AtmosphereModels.compute_datetime(saved.time, epoch), ENA_COORDINATE...), 0.0)
+solar_position = FixedCosineZenith(cos_zenith)
+native = make_case(input; nx, dx, order, architecture=GPU(), solar_position)
+model = native.model; Nz = length(native.z)
 
 # Window inputs, all on the architecture of the model they are used with (no host reads while traced).
 function window_inputs(arch)
@@ -118,7 +127,7 @@ fd = [(k, ε, (J([k == 1 ? ε : 0, k == 2 ? ε : 0]) - J([k == 1 ? -ε : 0, k ==
 # Construction runs eager operations on concrete Reactant arrays (e.g. the SAM sponge's initial horizontal
 # average), which index element by element. Scalar access is allowed for construction only; the compiled
 # programs below trace these operations instead.
-rcase = with_large_stack(() -> CUDA.@allowscalar make_case(input; nx, dx, order, architecture=ReactantState()))
+rcase = with_large_stack(() -> CUDA.@allowscalar make_case(input; nx, dx, order, architecture=ReactantState(), solar_position))
 rmodel = rcase.model
 set!(rmodel.radiation.surface_radiation.surface_temperature, saved.sst)
 rinputs = window_inputs(ReactantState())
@@ -150,7 +159,8 @@ results = Dict("scope" => "pathwise derivative of a $(steps)-step window from a 
     "radiation_updates_in_window" => 1 + count(n -> n > 0 && n % 30 == 0, 0:steps-1),
     "objective" => "LWP/(50 g m-2) + vapor path below 2.5 km/(1 kg m-2), domain mean, end of window",
     "controls" => "normalized: x1*3 K/day, x2*2 g/kg/day, tapered to zero at 2.5 km",
-    "spunup_time_s" => saved.time, "start_lwp_gm2" => cloud_lwp, "sst_K" => saved.sst,
+    "spunup_time_s" => saved.time, "cos_zenith_fixed" => cos_zenith,
+    "solar_position" => "fixed at window start (traced DateTime unsupported)", "start_lwp_gm2" => cloud_lwp, "sst_K" => saved.sst,
     "J_native" => J0, "J_native_repeat" => J0_repeat, "J_compiled" => Jc, "J_gradient_primal" => Jg, "primal_parity" => parity,
     "gradient" => g, "best_relative_error" => best, "native_window_seconds" => native_seconds,
     "primal_compile_seconds" => primal_compile, "gradient_compile_seconds" => gradient_compile,

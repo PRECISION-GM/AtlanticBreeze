@@ -15,9 +15,10 @@ grid_spacing() = parse(Float64, get(ENV, "ATLANTIC_DX", "100"))
 # Minimum halos Oceananigans accepted for these schemes (WENO9 rejects (5,5,5)).
 advection_halo(order) = order == 9 ? (6, 6, 5) : order == 5 ? (5, 5, 5) : error("ATLANTIC_ORDER must be 5 or 9")
 const TAPER_TOP = 2500.0
+const ENA_COORDINATE = (-28.0257, 39.0916)  # (longitude, latitude) of the ARM ENA site
 
 function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1,
-                   order=advection_order(), dx=grid_spacing())
+                   order=advection_order(), dx=grid_spacing(), solar_position=nothing)
     config = TOML.parsefile(joinpath(input, "interval.toml"))
     isnothing(nx) && (nx = config["nx"])
     Oceananigans.defaults.FloatType = Float64
@@ -65,7 +66,9 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
     radiation=RadiativeTransferModel(grid,EcCKDOptics(; clouds=CloudScatteringTables()),constants;
         surface_temperature,surface_albedo=0.07,surface_emissivity=0.95,
         background_atmosphere=BackgroundAtmosphere(CO₂=405e-6,CH₄=1.85e-6,N₂O=330e-9),
-        solar_position=ApparentSolarPosition(;coordinate=(-28.0257,39.0916),epoch=DateTime(config["epoch"])),
+        # The gradient check passes a FixedCosineZenith: ApparentSolarPosition builds a DateTime from the clock,
+        # which Reactant cannot trace.
+        solar_position=something(solar_position,ApparentSolarPosition(;coordinate=ENA_COORDINATE,epoch=DateTime(config["epoch"]))),
         schedule=IterationInterval(30),liquid_effective_radius=ConstantRadiusParticles(14e-6),
         ice_effective_radius=ConstantRadiusParticles(30e-6),
         # Radiation sees a continued column above the 8 km LES top: 40 layers to 65 km, standard-atmosphere

@@ -21,9 +21,11 @@ saved = deserialize(ENV["ATLANTIC_STATE"]); nx = saved.nx
 dx = grid_spacing(); order = advection_order()
 kw = (; nx, dx, order, solar_position=FixedCosineZenith(0.58), lookup_search=NumericalRadiation.FixedBinarySearch())
 
+# Host arrays are moved to the model's architecture before they touch its fields.
+on(arch, x) = arch isa ReactantState ? Reactant.to_rarray(x) : on_architecture(arch, x)
 function prepare!(case)
-    model = case.model
-    for (n, f) in pairs(prognostic_fields(model)); interior(f) .= saved.fields[String(n)]; end
+    model = case.model; arch = model.grid.architecture
+    for (n, f) in pairs(prognostic_fields(model)); interior(f) .= on(arch, saved.fields[String(n)]); end
     update_state!(model)
     return model
 end
@@ -57,10 +59,10 @@ J_native(model) = (p3!(model); s = snapshot(model); sum(sum(weights[n] .* s[n]) 
 direction = Dict(n => randn(size(interior(getproperty(μ, Symbol(n))))) for n in ("qᵛ", "qᶜˡ"))
 scale = Dict(n => max(maximum(abs, interior(getproperty(μ, Symbol(n)))), eps()) for n in keys(direction))
 function nudge!(model, ε)
-    for (n, d) in direction; f = getproperty(model.microphysical_fields, Symbol(n)); interior(f) .+= ε .* scale[n] .* d; end
+    for (n, d) in direction; f = getproperty(model.microphysical_fields, Symbol(n)); interior(f) .+= on(GPU(), ε .* scale[n] .* d); end
 end
 base = Dict(n => copy(Array(interior(getproperty(μ, Symbol(n))))) for n in keys(direction))
-restore!(model) = for (n, b) in base; interior(getproperty(model.microphysical_fields, Symbol(n))) .= b; end
+restore!(model) = for (n, b) in base; interior(getproperty(model.microphysical_fields, Symbol(n))) .= on(GPU(), b); end
 fd = map((1e-2, 1e-3, 1e-4, 1e-5, 1e-6)) do ε
     nudge!(native, ε); Jp = J_native(native); restore!(native)
     nudge!(native, -ε); Jm = J_native(native); restore!(native)

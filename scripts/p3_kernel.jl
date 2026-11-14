@@ -8,7 +8,7 @@
 using Reactant, Enzyme
 include("model.jl")
 using Oceananigans: prognostic_fields
-using Oceananigans.Architectures: ReactantState
+using Oceananigans.Architectures: ReactantState, on_architecture
 using Oceananigans.TimeSteppers: update_state!
 using Serialization, Random
 Reactant.set_default_backend("gpu")

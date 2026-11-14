@@ -41,7 +41,7 @@ function cell_result(q, i, j, k)
 end
 const NAMES = ("ρqᵛ", "ρqᶜˡ", "ρnᶜˡ", "ρnᵃ", "ρqʳ", "ρnʳ")
 tendency(r, n) = getfield(r, Symbol("tendency_", n))
-L(q, i, j, k) = (r = cell_result(q, i, j, k); sum(g.weights[n][i, j, k] * tendency(r, n) for n in NAMES))
+cell_L(q, i, j, k) = (r = cell_result(q, i, j, k); sum(g.weights[n][i, j, k] * tendency(r, n) for n in NAMES))
 
 # Cells: NaN AD, worst finite disagreements, and agreeing rain cells as controls.
 ad = g.ad; floor = 1e-6 * maximum(abs, filter(isfinite, ad))
@@ -57,9 +57,9 @@ cells = vcat([(:nan, c) for c in nan[1:min(5, end)]], [(:bad, c) for c in finite
 rows = []
 for (kind, c) in cells
     i, j, k = Tuple(c); q0 = Array(interior(μ.qᵛ))[i, j, k]
-    native_ad = Enzyme.autodiff(Enzyme.Forward, q -> L(q, i, j, k), Enzyme.Duplicated(q0, 1.0))[1]
-    fd = [(ε, (L(q0 + ε, i, j, k) - L(q0 - ε, i, j, k)) / 2ε) for ε in (1e-6, 1e-8, 1e-10, 1e-12)]
-    δ = range(-1e-7, 1e-7; length=401); scan = [L(q0 + d, i, j, k) for d in δ]
+    native_ad = Enzyme.autodiff(Enzyme.Forward, q -> cell_L(q, i, j, k), Enzyme.Duplicated(q0, 1.0))[1]
+    fd = [(ε, (cell_L(q0 + ε, i, j, k) - cell_L(q0 - ε, i, j, k)) / 2ε) for ε in (1e-6, 1e-8, 1e-10, 1e-12)]
+    δ = range(-1e-7, 1e-7; length=401); scan = [cell_L(q0 + d, i, j, k) for d in δ]
     second = maximum(abs, diff(diff(scan))) / max(maximum(abs, diff(scan)), eps())
     r = cell_result(q0, i, j, k)
     push!(rows, (; kind, cell=(i, j, k), q0, reactant_ad=ad[c], native_ad, fd, scan_kink=second,

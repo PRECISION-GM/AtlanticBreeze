@@ -35,17 +35,32 @@ fluxes(rtm) = [Array(interior(f)) for f in (rtm.upwelling_longwave_flux, rtm.dow
                                              rtm.upwelling_shortwave_flux, rtm.downwelling_shortwave_flux)]
 radiate!(model) = (Breeze.AtmosphereModels._update_radiation!(model.radiation, model); nothing)
 
-native = prepare!(make_case(input; nx, dx, order, architecture=GPU(), solar_position, lookup_search))
+native_build = @elapsed native = prepare!(make_case(input; nx, dx, order, architecture=GPU(), solar_position, lookup_search))
 radiate!(native); F0 = fluxes(native.radiation)
-note("native"; seconds=@elapsed(radiate!(native)), olr=maximum(F0[1][:, :, end]))
+note("native"; build_seconds=native_build, seconds=@elapsed(radiate!(native)), olr=maximum(F0[1][:, :, end]))
 
-rmodel = CUDA.@allowscalar prepare!(make_case(input; nx, dx, order, architecture=ReactantState(), solar_position, lookup_search))
+reactant_build = @elapsed rmodel = CUDA.@allowscalar prepare!(make_case(input; nx, dx, order, architecture=ReactantState(), solar_position, lookup_search))
 options = Reactant.CompileOptions(raise=true, raise_first=true, sync=true, excluded_passes=["concat_insert_dim_elementwise"])
 t = @elapsed compiled = Reactant.@compile compile_options=options radiate!(rmodel)
 compiled(rmodel); F1 = fluxes(rmodel.radiation)
 parity = maximum(maximum(abs.(a .- b)) / max(maximum(abs.(a)), eps()) for (a, b) in zip(F0, F1))
-note("compiled radiation"; compile_seconds=t, parity)
+note("compiled radiation"; reactant_build_seconds=reactant_build, compile_seconds=t, parity)
 println(parity < 1e-10 ? "RADIATION_PARITY_PASS" : "RADIATION_PARITY_FAIL", " nx=$nx parity=$parity compile_s=$t")
+
+# ATLANTIC_STAGES containing "step": compile one full time step (radiation due at iteration 0) and
+# compare every prognostic field with one native step from the same state.
+if occursin("step", get(ENV, "ATLANTIC_STAGES", ""))
+    using Breeze.TimeSteppers: prepare_first_time_step!
+    Δt = TOML.parsefile(joinpath(input, "interval.toml"))["dt"]
+    step!(model, Δt) = (prepare_first_time_step!(model, Δt); time_step!(model, Δt); nothing)
+    step!(native, Δt)
+    ts = @elapsed compiled_step = Reactant.@compile compile_options=options step!(rmodel, Δt)
+    compiled_step(rmodel, Δt)
+    step_parity = maximum(begin a = Array(interior(f)); b = Array(interior(getproperty(prognostic_fields(rmodel), n)))
+                          maximum(abs.(a .- b)) / max(maximum(abs.(a)), eps()) end for (n, f) in pairs(prognostic_fields(native)))
+    note("compiled step"; compile_seconds=ts, step_parity)
+    println(step_parity < 1e-10 ? "STEP_PARITY_PASS" : "STEP_PARITY_FAIL", " nx=$nx parity=$step_parity compile_s=$ts")
+end
 
 if get(ENV, "ATLANTIC_GRADIENT", "0") == "1"
     heating(model) = (radiate!(model); sum(interior(model.radiation.downwelling_longwave_flux)))

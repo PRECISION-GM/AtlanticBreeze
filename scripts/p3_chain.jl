@@ -72,11 +72,35 @@ function chain(q, c, i, j, k)
     rain_relaxation = PPP.rain_vapor_relaxation_coefficient(p3, qʳ, nʳ, ρ, transport)
     ℒˡ = PPP.vaporization_latent_heat(constants, adj.T)
     external_driver = PPP.external_vapor_excess_forcing(adj.qᵛ⁺ˡ, ℒˡ, adj.T, adj.P, tT, tp, constants)
+    # Replay of compute_p3_process_rates' setup (process_rates.jl) to reach phase 1 and the coupled rates.
+    parameters = p3.process_rates
+    qʷⁱ = PPP.active_liquid_on_ice(p3, ℳ.qʷⁱ)
+    cloud = PPP.diagnose_cloud_dsd(p3, adj.qᶜˡ, ℳ.nᶜˡ, ρ)
+    ℳa = PPP.P3MicrophysicalState(adj.qᶜˡ, ℳ.nᶜˡ, qʳ, ℳ.nʳ, ℳ.qⁱ, ℳ.nⁱ, props.qᶠ, props.bᶠ, qʷⁱ, adj.qᵛ - adj.qᵛ⁺ˡ, ℳ.nᵃ, ℳ.w)
+    qsat_ice = PPP.p3_ice_saturation_specific_humidity(adj.T, adj.ρᵗʰ, constants, parameters.freezing_temperature, adj.qᵛ⁺ˡ)
+    lookups = PPP.p3_ice_lookups(p3, ℳ.qⁱ, qʷⁱ, props.nⁱ, props.Fᶠ, props.Fˡ, props.ρᶠ, ρ)
+    state = PPP.P3DerivedState{FT, typeof(adj.q), typeof(lookups)}(props.nⁱ, nʳ, props.qᶠ, props.bᶠ, props.Fᶠ, props.ρᶠ,
+        props.Fˡ, cloud.Nᶜˡ, cloud.nᶜˡ, cloud.μᶜˡ, cloud.λᶜˡ, adj.T, adj.P, adj.qᵛ, adj.qᵛ⁺ˡ, qsat_ice, adj.q, adj.ρᵗʰ,
+        transport.Dᵛ, transport.Kᵃ, transport.ν, lookups)
+    phase1 = PPP.p3_phase1_rates(p3, ρ, ℳa, constants, state, tT, tp)
+    # Internals of coupled_saturation_adjustment_rates for the rain share (coupled_saturation_adjustment.jl).
+    τ = max(parameters.sink_limiting_timescale, eps(FT))
+    Rᵛ = FT(PPP.vapor_gas_constant(constants))
+    cᵖᵈ = PPP.p3_dry_air_heat_capacity(constants, FT)
+    ξˡ = 1 + ℒˡ * (adj.qᵛ⁺ˡ * ℒˡ / (Rᵛ * adj.T^2)) / cᵖᵈ
+    cloud_relaxation = PPP.cloud_vapor_relaxation_coefficient(p3, adj.qᶜˡ, ρ, transport.Dᵛ, cloud.μᶜˡ, cloud.λᶜˡ, cloud.nᶜˡ)
+    total_relaxation = max(cloud_relaxation + rain_relaxation, FT(parameters.floors.rate_scale))
+    transient_response = (1 - exp(-total_relaxation * τ)) / τ
+    raw_rain_growth = PPP.growth_share(rain_relaxation, ξˡ, external_driver, total_relaxation, adj.qᵛ - adj.qᵛ⁺ˡ, transient_response)
+    vr = PPP.coupled_saturation_adjustment_rates(p3, ℳa.qᶜˡ, qʳ, nʳ, ℳa.qⁱ, qʷⁱ, props.nⁱ, adj.qᵛ, adj.qᵛ⁺ˡ, qsat_ice,
+        props.Fᶠ, props.ρᶠ, adj.T, adj.P, ρ, constants, transport, adj.q, cloud.μᶜˡ, cloud.λᶜˡ, cloud.nᶜˡ, tT, tp, lookups)
     rates = PPP.compute_p3_process_rates(p3, ρ, ℳ, 𝒰, constants, props, Ts, tT, tp)
     result = PPP.p3_tendency_compute(p3, ρ, ℳ, 𝒰, constants, props, Ts, tT, tp)
     return (; q_in=q, qv_moisture=qf.vapor, T_diag, ρᵗʰ, qsat_diag, adj_rate=adj.rate, adj_qv=adj.qᵛ, adj_T=adj.T,
               adj_qsat=adj.qᵛ⁺ˡ, vapor_excess=adj.qᵛ - adj.qᵛ⁺ˡ, ν=transport.ν, Dᵛ=transport.Dᵛ, rain_relaxation,
-              external_driver, rate_rain_evaporation=rates.rain_evaporation,
+              external_driver, ξˡ, cloud_relaxation, total_relaxation, transient_response, raw_rain_growth,
+              coupled_rain_evaporation=vr.rain_evaporation, phase1_rain_evaporation=phase1.rain_evaporation,
+              rate_rain_evaporation=rates.rain_evaporation,
               rate_rain_evaporation_number=rates.rain_evaporation_number, rate_rain_condensation=rates.rain_condensation,
               tendency_ρqʳ=result.tendency_ρqʳ, tendency_ρnʳ=result.tendency_ρnʳ, tendency_ρqᵛ=result.tendency_ρqᵛ)
 end

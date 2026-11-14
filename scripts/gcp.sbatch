@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=atlantic-forward
-#SBATCH --partition=gpua100largex4,gpua100largex4spot
+#SBATCH --partition=gpua100largex4,gpua100,gpua100flex,gpuprodflex,gpuprod
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G

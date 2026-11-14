@@ -28,20 +28,27 @@ update_state!(model)
 PPP.compute_p3_surface_temperature!(μ.surface_temperature, model.temperature, grid)
 
 # Same steps as p3_grid_process_inputs + p3_tendency_compute, with the vapour input passed explicitly.
-function cell_result(q, i, j, k)
-    ρ = ρ_field[i, j, k]
-    ℳ = AM.grid_microphysical_state(i, j, k, grid, p3, μ, ρ, nothing, model.velocities)
-    qf = AM.moisture_fractions(p3, ℳ, q)
-    𝒰₀ = AM.diagnose_thermodynamic_state(i, j, k, grid, model.formulation, model.dynamics, qf)
-    𝒰 = AM.maybe_adjust_thermodynamic_state(𝒰₀, p3, q, constants)
-    tT = PPP.p3_adiabatic_temperature_tendency(ℳ, 𝒰, constants)
-    tp = PPP.p3_adiabatic_pressure_tendency(ρ, ℳ, constants)
-    props = PPP.p3_process_properties(p3, ρ, ℳ)
-    return PPP.p3_tendency_compute(p3, ρ, ℳ, 𝒰, constants, props, μ.surface_temperature[i, j, 1], tT, tp)
-end
+# Everything else arrives through one concretely typed context, so Enzyme sees no untyped globals.
 const NAMES = ("ρqᵛ", "ρqᶜˡ", "ρnᶜˡ", "ρnᵃ", "ρqʳ", "ρnʳ")
+ctx = (; ρ_field, μ, p3, grid, constants, velocities=model.velocities, formulation=model.formulation,
+         dynamics=model.dynamics, w=NamedTuple{Tuple(Symbol.(NAMES))}(Tuple(g.weights[n] for n in NAMES)))
+function cell_result(q, c, i, j, k)
+    ρ = c.ρ_field[i, j, k]
+    ℳ = AM.grid_microphysical_state(i, j, k, c.grid, c.p3, c.μ, ρ, nothing, c.velocities)
+    qf = AM.moisture_fractions(c.p3, ℳ, q)
+    𝒰₀ = AM.diagnose_thermodynamic_state(i, j, k, c.grid, c.formulation, c.dynamics, qf)
+    𝒰 = AM.maybe_adjust_thermodynamic_state(𝒰₀, c.p3, q, c.constants)
+    tT = PPP.p3_adiabatic_temperature_tendency(ℳ, 𝒰, c.constants)
+    tp = PPP.p3_adiabatic_pressure_tendency(ρ, ℳ, c.constants)
+    props = PPP.p3_process_properties(c.p3, ρ, ℳ)
+    return PPP.p3_tendency_compute(c.p3, ρ, ℳ, 𝒰, c.constants, props, c.μ.surface_temperature[i, j, 1], tT, tp)
+end
+function cell_L(q, c, i, j, k)
+    r = cell_result(q, c, i, j, k); w = c.w
+    return w.ρqᵛ[i, j, k] * r.tendency_ρqᵛ + w.ρqᶜˡ[i, j, k] * r.tendency_ρqᶜˡ + w.ρnᶜˡ[i, j, k] * r.tendency_ρnᶜˡ +
+           w.ρnᵃ[i, j, k] * r.tendency_ρnᵃ + w.ρqʳ[i, j, k] * r.tendency_ρqʳ + w.ρnʳ[i, j, k] * r.tendency_ρnʳ
+end
 tendency(r, n) = getfield(r, Symbol("tendency_", n))
-cell_L(q, i, j, k) = (r = cell_result(q, i, j, k); sum(g.weights[n][i, j, k] * tendency(r, n) for n in NAMES))
 
 # Cells: NaN AD, worst finite disagreements, and agreeing rain cells as controls.
 ad = g.ad; floor = 1e-6 * maximum(abs, filter(isfinite, ad))
@@ -57,11 +64,11 @@ cells = vcat([(:nan, c) for c in nan[1:min(5, end)]], [(:bad, c) for c in finite
 rows = []
 for (kind, c) in cells
     i, j, k = Tuple(c); q0 = Array(interior(μ.qᵛ))[i, j, k]
-    native_ad = Enzyme.autodiff(Enzyme.set_runtime_activity(Enzyme.Forward), q -> cell_L(q, i, j, k), Enzyme.Duplicated(q0, 1.0))[1]
-    fd = [(ε, (cell_L(q0 + ε, i, j, k) - cell_L(q0 - ε, i, j, k)) / 2ε) for ε in (1e-6, 1e-8, 1e-10, 1e-12)]
-    δ = range(-1e-7, 1e-7; length=401); scan = [cell_L(q0 + d, i, j, k) for d in δ]
+    native_ad = Enzyme.autodiff(Enzyme.set_runtime_activity(Enzyme.Forward), cell_L, Enzyme.Duplicated(q0, 1.0), Enzyme.Const(ctx), Enzyme.Const(i), Enzyme.Const(j), Enzyme.Const(k))[1]
+    fd = [(ε, (cell_L(q0 + ε, ctx, i, j, k) - cell_L(q0 - ε, ctx, i, j, k)) / 2ε) for ε in (1e-6, 1e-8, 1e-10, 1e-12)]
+    δ = range(-1e-7, 1e-7; length=401); scan = [cell_L(q0 + d, ctx, i, j, k) for d in δ]
     second = maximum(abs, diff(diff(scan))) / max(maximum(abs, diff(scan)), eps())
-    r = cell_result(q0, i, j, k)
+    r = cell_result(q0, ctx, i, j, k)
     push!(rows, (; kind, cell=(i, j, k), q0, reactant_ad=ad[c], native_ad, fd, scan_kink=second,
                  result=NamedTuple{Tuple(Symbol("tendency_", n) for n in NAMES)}(Tuple(tendency(r, n) for n in NAMES))))
     println(kind, " ", (i, j, k), " qv=", q0, " ρqr=", g.qr[c], " reactant_ad=", ad[c], " native_enzyme=", native_ad,

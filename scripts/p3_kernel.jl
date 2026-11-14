@@ -52,24 +52,26 @@ worst = maximum(values(parity))
 note("compiled P3 kernel"; compile_seconds=tc, worst, parity)
 println(worst < 1e-10 ? "P3_PARITY_PASS" : "P3_PARITY_FAIL", " nx=$nx parity=$worst compile_s=$tc")
 
-# Scalar of the tendencies: condensate and aerosol source terms weighted by fixed random patterns.
+for n in sort(collect(keys(parity))); println("parity ", n, " ", parity[n], " max|G|=", maximum(abs, G0[n])); end
+
+# The kernel is pointwise in its vapour input μ.qᵛ, so with a per-cell scalar L = Σₙ wₙ Gₙ (weights
+# normalized by each tendency's magnitude) the reverse derivative at a cell, ∂L/∂qᵛ, can be compared
+# cell by cell with native central differences of that cell's own L. (The kernel reads ρqᶜˡ from the
+# prognostic fields, not μ.qᶜˡ, so only qᵛ is perturbed.)
 Random.seed!(1)
-weights = Dict(n => randn(size(G0[n])) for n in ("ρqᶜˡ", "ρnᶜˡ", "ρnᵃ", "ρqᵛ"))
-J_native(model) = (p3!(model); s = snapshot(model); sum(sum(weights[n] .* s[n]) for n in keys(weights)))
-direction = Dict(n => randn(size(interior(getproperty(μ, Symbol(n))))) for n in ("qᵛ", "qᶜˡ"))
-scale = Dict(n => max(maximum(abs, interior(getproperty(μ, Symbol(n)))), eps()) for n in keys(direction))
-function nudge!(model, ε)
-    for (n, d) in direction; f = getproperty(model.microphysical_fields, Symbol(n)); interior(f) .+= on(GPU(), ε .* scale[n] .* d); end
-end
-base = Dict(n => copy(Array(interior(getproperty(μ, Symbol(n))))) for n in keys(direction))
-restore!(model) = for (n, b) in base; interior(getproperty(model.microphysical_fields, Symbol(n))) .= on(GPU(), b); end
-fd = map((1e-2, 1e-3, 1e-4, 1e-5, 1e-6)) do ε
-    nudge!(native, ε); Jp = J_native(native); restore!(native)
-    nudge!(native, -ε); Jm = J_native(native); restore!(native)
-    (ε, (Jp - Jm) / 2ε)
+names = ("ρqᵛ", "ρqᶜˡ", "ρnᶜˡ", "ρnᵃ", "ρqʳ", "ρnʳ")
+weights = Dict(n => randn(size(G0[n])) ./ max(maximum(abs, G0[n]), eps()) for n in names)
+local_L(s) = sum(weights[n] .* s[n] for n in names)
+qv = getproperty(μ, :qᵛ); base = Array(interior(qv)); scale = maximum(abs, base)
+qc = Array(interior(μ.ρqᶜˡ)); cloudy = qc .> 1e-6 .* maximum(qc)
+function fd_cells(ε)
+    interior(qv) .= on(GPU(), base .+ ε * scale); p3!(native); Lp = local_L(snapshot(native))
+    interior(qv) .= on(GPU(), base .- ε * scale); p3!(native); Lm = local_L(snapshot(native))
+    interior(qv) .= on(GPU(), base)
+    return (Lp .- Lm) ./ (2ε * scale)
 end
 
-wr = Dict(n => Reactant.to_rarray(w) for (n, w) in weights)
+wr = Dict(n => Reactant.to_rarray(weights[n]) for n in names)
 function J(model, wr)
     p3!(model); Gm = G(model)
     return sum(sum(interior(getproperty(Gm, Symbol(n))) .* w) for (n, w) in wr)
@@ -78,8 +80,20 @@ grad!(m, dm, wr) = (Enzyme.autodiff(Enzyme.set_strong_zero(Enzyme.Reverse), J, E
 dm = Enzyme.make_zero(rmodel)
 tg = @elapsed cg = Reactant.@compile compile_options=options grad!(rmodel, dm, wr)
 cg(rmodel, dm, wr)
-ad = sum(sum(Array(interior(getproperty(dm.microphysical_fields, Symbol(n)))) .* scale[n] .* d) for (n, d) in direction)
-for (ε, g) in fd; note("fd"; ε, g, relative_error=abs(g - ad) / max(abs(ad), eps())); end
-best = minimum(abs(g - ad) / max(abs(ad), eps()) for (_, g) in fd)
-note("P3 reverse"; compile_seconds=tg, ad, best)
-println(best < 1e-4 ? "P3_GRADIENT_PASS" : "P3_GRADIENT_FAIL", " ad=$ad best_rel=$best compile_s=$tg")
+ad = Array(interior(dm.microphysical_fields.qᵛ))
+floor = 1e-6 * maximum(abs, ad)
+best = fill(Inf, size(ad))
+for ε in (1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8)
+    err = abs.(fd_cells(ε) .- ad) ./ (abs.(ad) .+ floor)
+    global best = min.(best, err)
+    frac(m) = count(err[m] .< 1e-3) / max(count(m), 1)
+    note("fd"; ε, median_error=sort(vec(err))[end ÷ 2], within_1e3_all=frac(trues(size(err))),
+         within_1e3_cloudy=frac(cloudy), within_1e3_clear=frac(.!cloudy))
+end
+bad = findall(best .> 1e-3)
+note("P3 reverse"; compile_seconds=tg, cells=length(ad), cloudy_cells=count(cloudy), bad_cells=length(bad), bad_cloudy=count(cloudy[bad]),
+     max_abs_ad=maximum(abs, ad))
+for c in bad[sortperm(best[bad], rev=true)][1:min(10, end)]
+    println("bad cell ", Tuple(c), " ad=", ad[c], " best_rel=", best[c], " qv=", base[c], " ρqcl=", qc[c])
+end
+println(isempty(bad) ? "P3_GRADIENT_PASS" : "P3_GRADIENT_FAIL", " bad_cells=$(length(bad))/$(length(ad)) compile_s=$tg")

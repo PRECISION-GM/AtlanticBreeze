@@ -10,7 +10,7 @@ function train()
     output=get(ENV,"ATLANTIC_OUTPUT","outputs/training")
     isdir(output) && !isempty(readdir(output)) && error("Training output already exists")
     mkpath(output)
-    nx=parse(Int,get(ENV,"ATLANTIC_NX","128")); iterations=parse(Int,get(ENV,"ATLANTIC_TRAIN_ITERATIONS","1"))
+    nx=haskey(ENV,"ATLANTIC_NX") ? parse(Int,ENV["ATLANTIC_NX"]) : TOML.parsefile(joinpath(input,"interval.toml"))["nx"]; iterations=parse(Int,get(ENV,"ATLANTIC_TRAIN_ITERATIONS","1"))
     # Wall-clock budget (s): stop before an evaluation that would not finish inside the job.
     budget=parse(Float64,get(ENV,"ATLANTIC_BUDGET_SECONDS","82800")); start=time()
     # Controls are normalized by their bounds (±3 K/day, ±2 g/kg/day), so x ∈ [-1, 1]².
@@ -38,7 +38,7 @@ function train()
         meta=TOML.parsefile(joinpath(baseline,"run.toml"))
         meta["complete_interval"] && meta["temperature_correction_Kday"]==0 && meta["moisture_correction_gkgday"]==0 &&
             meta["input"]==abspath(input) && meta["nx"]==nx && meta["aerosol_setting"]==get(ENV,"ATLANTIC_AEROSOL","aer1") &&
-            meta["order"]==advection_order() && meta["dx_m"]==grid_spacing() ||
+            meta["order"]==advection_order() && meta["dx_m"]==grid_spacing(TOML.parsefile(joinpath(input,"interval.toml"))["dx"]) ||
             error("ATLANTIC_BASELINE is not a complete matching uncorrected run")
         loss=meta["loss"]; best=baseline; push!(costs,meta["wall_seconds"])
     end

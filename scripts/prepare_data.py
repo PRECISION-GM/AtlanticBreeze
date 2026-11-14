@@ -3,12 +3,14 @@ import argparse,datetime,json,hashlib
 from pathlib import Path
 import numpy as np
 import netCDF4 as nc
-p=argparse.ArgumentParser();p.add_argument('--data-dir',type=Path,default=Path('data/march2016'));p.add_argument('--output',type=Path,default=Path('data/interval'));a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+p=argparse.ArgumentParser();p.add_argument('--data-dir',type=Path,default=Path('data/march2016'));p.add_argument('--output',type=Path,default=Path('data/interval'))
+# --refine r splits every baseline cell into r (and divides dx and dt by r, nx times r): same 12.8 km domain.
+p.add_argument('--refine',type=int,default=1);a=p.parse_args();r=a.refine;a.output.mkdir(parents=True,exist_ok=True)
 root=a.data_dir;used=[]
 def load(path):used.append(path);return nc.Dataset(path)
 def values(d,k):return np.asarray(np.ma.filled(d[k][:],np.nan),float)
 def stamp(d):return values(d,'time')+float(d['base_time'][...])
-faces=np.r_[np.arange(0,2500+1,25),np.arange(2600,8000+1,100)];z=(faces[:-1]+faces[1:])/2
+faces=np.r_[np.arange(0,2500+1e-9,25/r),np.arange(2500+100/r,8000+1e-9,100/r)];z=(faces[:-1]+faces[1:])/2
 np.savetxt(a.output/'faces.csv',faces,delimiter=',')
 files=sorted((root/'arm/enasondewnpnC1.b1').glob('*20160304*'))
 assert len(files)==2,'Expected exactly the two March 4 soundings; select another pair explicitly.'
@@ -60,6 +62,6 @@ with load(next((root/'arm/enamwrret2turnC1.c1').glob('*20160304*'))) as d:
   bins.append([lo,min(lo+600,duration),np.mean(lwp[ok]) if ok.sum()>=10 and ok.sum()>=.5*use.sum() else np.nan,ok.sum(),use.sum()])
  np.savetxt(a.output/'lwp.csv',bins,delimiter=',',header='start_s,end_s,LWP_gm2,n_valid,n_total',comments='')
 epoch=datetime.datetime.fromtimestamp(t0,datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
-(a.output/'interval.toml').write_text(f'epoch = "{epoch}"\nduration = {duration}\nspinup = 3600.0\nnx = 128\ndx = 100.0\ndt = 1.0\n')
-manifest={'sources':[{ 'file':str(f.relative_to(root)),'sha256':hashlib.sha256(f.read_bytes()).hexdigest()} for f in dict.fromkeys(used)],'smoothing':'50 m centered average, linear interpolation in empty bins; no artificial mixed-layer replacement','humidity':'sonde dewpoint to specific humidity; initial condensate-free state','forcing':'ERA5 central horizontal differences on pressure surfaces; theta advection converted with Exner; omega converted to w; geostrophic wind from geopotential gradient; nearest ENA gridpoint','loss':'post-spinup QC-screened 10-minute LWP plus final sounding 0–2500m; sonde profile acquisition treated at launch time','known_limits':['No initial cloud-water retrieval','Below the lowest ERA5 level, advection and geostrophic wind hold the lowest value; w tapers linearly to zero at the surface','Paper physical LWP is not necessarily this ARM MWRRET retrieval','Small periodic domain is a candidate, not validated minimum']}
+(a.output/'interval.toml').write_text(f'epoch = "{epoch}"\nduration = {duration}\nspinup = 3600.0\nnx = {128*r}\ndx = {100.0/r}\ndt = {1.0/r}\n')
+manifest={'sources':[{ 'file':str(f.relative_to(root)),'sha256':hashlib.sha256(f.read_bytes()).hexdigest()} for f in dict.fromkeys(used)],'refine':r,'smoothing':'50 m centered average, linear interpolation in empty bins; no artificial mixed-layer replacement','humidity':'sonde dewpoint to specific humidity; initial condensate-free state','forcing':'ERA5 central horizontal differences on pressure surfaces; theta advection converted with Exner; omega converted to w; geostrophic wind from geopotential gradient; nearest ENA gridpoint','loss':'post-spinup QC-screened 10-minute LWP plus final sounding 0–2500m; sonde profile acquisition treated at launch time','known_limits':['No initial cloud-water retrieval','Below the lowest ERA5 level, advection and geostrophic wind hold the lowest value; w tapers linearly to zero at the surface','Paper physical LWP is not necessarily this ARM MWRRET retrieval','Small periodic domain is a candidate, not validated minimum']}
 (a.output/'provenance.json').write_text(json.dumps(manifest,indent=2));print(epoch,duration,len(z),'levels;',len(rows)//len(z),'forcing knots')

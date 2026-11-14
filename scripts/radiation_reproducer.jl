@@ -35,11 +35,11 @@ fluxes(rtm) = [Array(interior(f)) for f in (rtm.upwelling_longwave_flux, rtm.dow
                                              rtm.upwelling_shortwave_flux, rtm.downwelling_shortwave_flux)]
 radiate!(model) = (Breeze.AtmosphereModels._update_radiation!(model.radiation, model); nothing)
 
-native = prepare!(make_case(input; nx, dx, order, architecture=GPU(), solar_position, lookup_search).model)
+native = prepare!(make_case(input; nx, dx, order, architecture=GPU(), solar_position, lookup_search))
 radiate!(native); F0 = fluxes(native.radiation)
 note("native"; seconds=@elapsed(radiate!(native)), olr=maximum(F0[1][:, :, end]))
 
-rmodel = CUDA.@allowscalar prepare!(make_case(input; nx, dx, order, architecture=ReactantState(), solar_position, lookup_search).model)
+rmodel = CUDA.@allowscalar prepare!(make_case(input; nx, dx, order, architecture=ReactantState(), solar_position, lookup_search))
 options = Reactant.CompileOptions(raise=true, raise_first=true, sync=true, excluded_passes=["concat_insert_dim_elementwise"])
 t = @elapsed compiled = Reactant.@compile compile_options=options radiate!(rmodel)
 compiled(rmodel); F1 = fluxes(rmodel.radiation)

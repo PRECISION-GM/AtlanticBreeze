@@ -1,6 +1,7 @@
 # Shared forward model and observation loss. All times are seconds since sounding launch.
 using Breeze, Oceananigans, CUDA
 import NumericalRadiation
+import NCDatasets
 using Oceananigans.Units
 using Oceananigans.Grids: znodes
 using Oceananigans.BoundaryConditions: fill_halo_regions!
@@ -11,16 +12,20 @@ readcsv(path) = readdlm(path, ',', Float64; skipstart=1)
 
 # aer1 matches March 4 surface UHSAS N(D>60 nm) ≈ 120–165 cm⁻³; LASSO aer2 is about twice that.
 advection_order() = parse(Int, get(ENV, "ATLANTIC_ORDER", "9"))   # 9 default; 5 is the authorized fallback
-grid_spacing() = parse(Float64, get(ENV, "ATLANTIC_DX", "100"))
+grid_spacing(default=100.0) = parse(Float64, get(ENV, "ATLANTIC_DX", string(default)))  # input default otherwise
 # Minimum halos Oceananigans accepted for these schemes (WENO9 rejects (5,5,5)).
 advection_halo(order) = order == 9 ? (6, 6, 5) : order == 5 ? (5, 5, 5) : error("ATLANTIC_ORDER must be 5 or 9")
 const TAPER_TOP = 2500.0
 const ENA_COORDINATE = (-28.0257, 39.0916)  # (longitude, latitude) of the ARM ENA site
 
 function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1,
-                   order=advection_order(), dx=grid_spacing(), solar_position=nothing, lookup_search=nothing)
+                   order=advection_order(), dx=nothing, solar_position=nothing, lookup_search=nothing)
     config = TOML.parsefile(joinpath(input, "interval.toml"))
     isnothing(nx) && (nx = config["nx"])
+    isnothing(dx) && (dx = grid_spacing(get(config, "dx", 100.0)))
+    # Radiation every 30 s of model time whatever the step (30 iterations at 1 s, 60 at 0.5 s).
+    radiation_iterations = round(Int, 30 / config["dt"])
+    radiation_iterations * config["dt"] ≈ 30 || error("dt=$(config["dt"]) does not divide the 30 s radiation cadence")
     Oceananigans.defaults.FloatType = Float64
     faces = vec(readdlm(joinpath(input, "faces.csv"), ',', Float64))
     initial = readcsv(joinpath(input, "initial.csv"))
@@ -69,7 +74,7 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         # The gradient check passes a FixedCosineZenith: ApparentSolarPosition builds a DateTime from the clock,
         # which Reactant cannot trace.
         solar_position=something(solar_position,ApparentSolarPosition(;coordinate=ENA_COORDINATE,epoch=DateTime(config["epoch"]))),
-        schedule=IterationInterval(30),liquid_effective_radius=ConstantRadiusParticles(14e-6),
+        schedule=IterationInterval(radiation_iterations),liquid_effective_radius=ConstantRadiusParticles(14e-6),
         ice_effective_radius=ConstantRadiusParticles(30e-6),
         # Radiation sees a continued column above the 8 km LES top: 40 layers to 65 km, standard-atmosphere
         # T/q anchored to the grid-top temperature, and the background standard ozone profile.
@@ -88,7 +93,44 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         set!(surface_temperature,L.interpolate_profile(times,sst_values,sim.model.clock.time))
         fill_halo_regions!(surface_temperature)
     end
-    return (;model,config,z,faces,pressure,refresh!,taper,order,dx)
+    return (;model,config,z,faces,pressure,density,refresh!,taper,order,dx,radiation_iterations)
+end
+
+# Domain-mean profiles (theta, qv, cloud and total liquid, cloud fraction, w variance), the LWP map and
+# x-z slices of liquid and w through the domain centre, appended along an unlimited time dimension.
+# Cloud fraction counts cells with cloud liquid above 1e-5 kg/kg.
+function diagnostics_writer(case,path)
+    grid=case.model.grid; nx,ny,nz=size(grid); dz=diff(case.faces); ρ=reshape(case.density,1,1,:)
+    NCDatasets.NCDataset(path,"c") do ds
+        NCDatasets.defDim(ds,"x",nx); NCDatasets.defDim(ds,"y",ny); NCDatasets.defDim(ds,"z",nz); NCDatasets.defDim(ds,"time",Inf)
+        NCDatasets.defVar(ds,"z",case.z,("z",); attrib=["units"=>"m"]); NCDatasets.defVar(ds,"x",((1:nx).-0.5).*case.dx,("x",); attrib=["units"=>"m"])
+        NCDatasets.defVar(ds,"time",Float64,("time",); attrib=["units"=>"s since sounding launch"])
+        for (n,u) in (("theta","K"),("qv","kg/kg"),("qc","kg/kg"),("ql","kg/kg"),("cloud_fraction","1"),("w_variance","m2/s2"))
+            NCDatasets.defVar(ds,n,Float32,("z","time"); attrib=["units"=>u])
+        end
+        NCDatasets.defVar(ds,"lwp",Float32,("x","y","time"); attrib=["units"=>"g/m2","comment"=>"cloud+rain+ice liquid coating"])
+        NCDatasets.defVar(ds,"ql_xz",Float32,("x","z","time"); attrib=["units"=>"kg/kg"])
+        NCDatasets.defVar(ds,"w_xz",Float32,("x","z","time"); attrib=["units"=>"m/s","comment"=>"w at cell centres"])
+    end
+    function write(sim)
+        m=sim.model; water=m.microphysical_fields; j=ny÷2
+        cloud=Array(interior(water.ρqᶜˡ))
+        liquid=cloud.+Array(interior(water.ρqʳ)).+Array(interior(water.ρqʷⁱ))
+        wf=Array(interior(m.velocities.w)); wc=(wf[:,:,1:end-1].+wf[:,:,2:end])./2
+        profile(a)=vec(mean(a;dims=(1,2)))
+        NCDatasets.NCDataset(path,"a") do ds
+            n=length(ds["time"])+1
+            ds["time"][n]=m.clock.time
+            ds["theta"][:,n]=profile(Array(interior(m.temperature))).*(1e5./case.pressure).^0.2857
+            ds["qv"][:,n]=profile(Array(interior(water.qᵛ)))
+            ds["qc"][:,n]=profile(cloud./ρ); ds["ql"][:,n]=profile(liquid./ρ)
+            ds["cloud_fraction"][:,n]=profile(cloud./ρ .> 1e-5)
+            ds["w_variance"][:,n]=profile(wc.^2).-profile(wc).^2
+            ds["lwp"][:,:,n]=1000 .*dropdims(sum(liquid.*reshape(dz,1,1,:);dims=3);dims=3)
+            ds["ql_xz"][:,:,n]=liquid[:,j,:]./reshape(case.density,1,:); ds["w_xz"][:,:,n]=wc[:,j,:]
+        end
+    end
+    return write
 end
 
 function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothing, cpu=false,
@@ -126,6 +168,10 @@ function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothin
         writedlm(joinpath(output,"lwp.csv"),vcat(header,reduce(vcat,permutedims.(records))),',')
     end
     add_callback!(simulation,diagnose,TimeInterval(60))
+    # Optional NetCDF diagnostics for figures and animation (ATLANTIC_DIAGNOSTICS_SECONDS > 0).
+    every=parse(Float64,get(ENV,"ATLANTIC_DIAGNOSTICS_SECONDS","0"))
+    every>0 && add_callback!(simulation,diagnostics_writer(case,joinpath(output,"diagnostics.nc")),TimeInterval(every))
+    meta["diagnostics_seconds"]=every; meta["radiation_iterations"]=case.radiation_iterations; writemeta()
     run!(simulation)
     (isempty(records) || last(records)[1]!=model.clock.time) && diagnose(simulation)
     result=reduce(vcat,permutedims.(records))

@@ -57,7 +57,7 @@ cells = vcat([(:nan, c) for c in nan[1:min(5, end)]], [(:bad, c) for c in finite
 rows = []
 for (kind, c) in cells
     i, j, k = Tuple(c); q0 = Array(interior(μ.qᵛ))[i, j, k]
-    native_ad = Enzyme.autodiff(Enzyme.Forward, q -> cell_L(q, i, j, k), Enzyme.Duplicated(q0, 1.0))[1]
+    native_ad = Enzyme.autodiff(Enzyme.set_runtime_activity(Enzyme.Forward), q -> cell_L(q, i, j, k), Enzyme.Duplicated(q0, 1.0))[1]
     fd = [(ε, (cell_L(q0 + ε, i, j, k) - cell_L(q0 - ε, i, j, k)) / 2ε) for ε in (1e-6, 1e-8, 1e-10, 1e-12)]
     δ = range(-1e-7, 1e-7; length=401); scan = [cell_L(q0 + d, i, j, k) for d in δ]
     second = maximum(abs, diff(diff(scan))) / max(maximum(abs, diff(scan)), eps())

@@ -74,5 +74,18 @@ for (kind, c) in cells
     println(kind, " ", (i, j, k), " qv=", q0, " ρqr=", g.qr[c], " reactant_ad=", ad[c], " native_enzyme=", native_ad,
             " fd=", [round(f; sigdigits=6) for (_, f) in fd], " scan_kink=", second)
 end
+# Per-tendency decomposition at the disagreeing cells: which tendency's qᵛ-derivative differs from FD.
+cell_T(q, c, i, j, k, ::Val{n}) where n = getfield(cell_result(q, c, i, j, k), n)
+for (kind, c) in cells
+    kind === :bad || continue
+    i, j, k = Tuple(c); q0 = Array(interior(μ.qᵛ))[i, j, k]
+    for n in NAMES
+        s = Val(Symbol("tendency_", n))
+        a = Enzyme.autodiff(Enzyme.set_runtime_activity(Enzyme.Forward), cell_T, Enzyme.Duplicated(q0, 1.0), Enzyme.Const(ctx),
+                            Enzyme.Const(i), Enzyme.Const(j), Enzyme.Const(k), Enzyme.Const(s))[1]
+        f = [(cell_T(q0 + ε, ctx, i, j, k, s) - cell_T(q0 - ε, ctx, i, j, k, s)) / 2ε for ε in (1e-8, 1e-10)]
+        println("decomp ", (i, j, k), " ", n, " value=", cell_T(q0, ctx, i, j, k, s), " enzyme=", a, " fd=", f)
+    end
+end
 serialize(joinpath(output, "p3_cells.jls"), rows)
 println("P3_CELLS_DONE cells=", length(rows))

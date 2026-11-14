@@ -1,7 +1,7 @@
 # Minimal Reactant compile test of the ecCKD radiation update alone (no time stepping): it builds the March
 # case on a tiny horizontal grid with the full vertical grid, continued column, cloud optics and fixed solar
 # position, then compiles `_update_radiation!` and compares the compiled fluxes with native CUDA fluxes.
-# ENV: ATLANTIC_NX (2), ATLANTIC_STATE (optional spun-up cloudy state from check_gradients.jl), ATLANTIC_GRADIENT
+# ENV: ATLANTIC_NX (8; at least the WENO halo), ATLANTIC_STATE (optional spun-up cloudy state from check_gradients.jl), ATLANTIC_GRADIENT
 # ("1" also compiles a reverse-mode derivative of total longwave heating w.r.t. the state).
 using Reactant, Enzyme
 include("model.jl")
@@ -10,10 +10,12 @@ using Oceananigans.Architectures: ReactantState
 using Oceananigans.TimeSteppers: update_state!
 using Serialization
 Reactant.set_default_backend("gpu")
+# Failed pass pipelines dump their MLIR next to the results instead of node-local /tmp.
+Reactant.MLIR.IR.DUMP_MLIR_DIR[] = mkpath(joinpath(get(ENV, "ATLANTIC_OUTPUT", "outputs"), "mlir"))
 note(msg; kw...) = (@info msg kw...; flush(stderr))
 
 input = get(ENV, "ATLANTIC_INPUT", "data/interval")
-nx = parse(Int, get(ENV, "ATLANTIC_NX", "2"))
+nx = parse(Int, get(ENV, "ATLANTIC_NX", "8"))
 dx = grid_spacing(); order = advection_order()
 solar_position = FixedCosineZenith(0.58)
 lookup_search = NumericalRadiation.FixedBinarySearch()

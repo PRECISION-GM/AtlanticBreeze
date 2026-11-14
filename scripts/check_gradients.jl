@@ -28,6 +28,8 @@ limits = [3.0, 2.0]
 isdir(output) && !isempty(readdir(output)) && error("Output directory is not empty: $output")
 mkpath(output)
 Reactant.set_default_backend("gpu")
+# Failed pass pipelines dump their MLIR next to the results instead of node-local /tmp.
+Reactant.MLIR.IR.DUMP_MLIR_DIR[] = mkpath(joinpath(get(ENV, "ATLANTIC_OUTPUT", "outputs"), "mlir"))
 note(msg; kw...) = (@info msg kw...; flush(stderr))
 
 # Spin up natively (true solar position) from the condensate-free sounding to a cloudy state, or load it.

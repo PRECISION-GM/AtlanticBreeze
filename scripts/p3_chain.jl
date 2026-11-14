@@ -92,13 +92,21 @@ function chain(q, c, i, j, k)
     total_relaxation = max(cloud_relaxation + rain_relaxation, FT(parameters.floors.rate_scale))
     transient_response = (1 - exp(-total_relaxation * τ)) / τ
     raw_rain_growth = PPP.growth_share(rain_relaxation, ξˡ, external_driver, total_relaxation, adj.qᵛ - adj.qᵛ⁺ˡ, transient_response)
+    # Algebraically identical, numerically stable rain share: with a = xτ (x = total relaxation),
+    # ext·f - (ext/x)·f·transient = ext·f·φ(a), φ(a) = 1 - (1 - e⁻ᵃ)/a, and transient = -expm1(-a)/τ.
+    # Diagnostic only: tests whether the FD plateau of raw_rain_growth is a cancellation artifact.
+    a = total_relaxation * τ
+    φ = a < 1e-3 ? a / 2 - a^2 / 6 + a^3 / 24 - a^4 / 120 : 1 - (-expm1(-a)) / a
+    transient_stable = -expm1(-a) / τ
+    f_rain = rain_relaxation / total_relaxation
+    raw_rain_growth_stable = (external_driver * f_rain * φ + (adj.qᵛ - adj.qᵛ⁺ˡ) * f_rain * transient_stable) / ξˡ
     vr = PPP.coupled_saturation_adjustment_rates(p3, ℳa.qᶜˡ, qʳ, nʳ, ℳa.qⁱ, qʷⁱ, props.nⁱ, adj.qᵛ, adj.qᵛ⁺ˡ, qsat_ice,
         props.Fᶠ, props.ρᶠ, adj.T, adj.P, ρ, constants, transport, adj.q, cloud.μᶜˡ, cloud.λᶜˡ, cloud.nᶜˡ, tT, tp, lookups)
     rates = PPP.compute_p3_process_rates(p3, ρ, ℳ, 𝒰, constants, props, Ts, tT, tp)
     result = PPP.p3_tendency_compute(p3, ρ, ℳ, 𝒰, constants, props, Ts, tT, tp)
     return (; q_in=q, qv_moisture=qf.vapor, T_diag, ρᵗʰ, qsat_diag, adj_rate=adj.rate, adj_qv=adj.qᵛ, adj_T=adj.T,
               adj_qsat=adj.qᵛ⁺ˡ, vapor_excess=adj.qᵛ - adj.qᵛ⁺ˡ, ν=transport.ν, Dᵛ=transport.Dᵛ, rain_relaxation,
-              external_driver, ξˡ, cloud_relaxation, total_relaxation, transient_response, raw_rain_growth,
+              external_driver, ξˡ, cloud_relaxation, total_relaxation, transient_response, raw_rain_growth, a_relaxation=a, transient_stable, raw_rain_growth_stable,
               coupled_rain_evaporation=vr.rain_evaporation, phase1_rain_evaporation=phase1.rain_evaporation,
               rate_rain_evaporation=rates.rain_evaporation,
               rate_rain_evaporation_number=rates.rain_evaporation_number, rate_rain_condensation=rates.rain_condensation,

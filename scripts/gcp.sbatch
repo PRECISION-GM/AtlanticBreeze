@@ -22,7 +22,9 @@ export ATLANTIC_OUTPUT="$ATLANTIC_OUTPUT/attempt-${SLURM_RESTART_COUNT:-0}"
 echo "commit $ATLANTIC_COMMIT input $ATLANTIC_INPUT output $ATLANTIC_OUTPUT"
 sha256sum scripts/*.jl Project.toml Manifest.toml gradient/*.toml "$ATLANTIC_INPUT"/*.csv
 mode="${1:-forward}"
-case "$mode" in forward|train) project=. ;; check_gradients) project=gradient ;; *) echo 'Expected forward, train or check_gradients'; exit 2;; esac
+case "$mode" in forward|train) project=. ;; check_gradients|radiation_reproducer) project=gradient ;; *) echo "Expected forward, train, check_gradients or radiation_reproducer"; exit 2;; esac
+# ATLANTIC_PROJECT selects another environment (e.g. one developing an isolated upstream checkout).
+project="${ATLANTIC_PROJECT:-$project}"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 # Peak device memory is sampled every 10 s alongside the run.
 nvidia-smi --query-gpu=timestamp,memory.used --format=csv,noheader -l 10 > "atlantic-${SLURM_JOB_ID}-gpumem.csv" &

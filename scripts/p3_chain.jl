@@ -10,6 +10,7 @@ using Enzyme
 include("model.jl")
 using Oceananigans: prognostic_fields
 using Oceananigans.TimeSteppers: update_state!
+using Oceananigans.Architectures: on_architecture
 using Serialization, Printf
 const AM = Breeze.AtmosphereModels
 const PPP = Breeze.Microphysics.PredictedParticleProperties

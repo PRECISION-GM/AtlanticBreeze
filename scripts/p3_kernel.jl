@@ -81,19 +81,28 @@ dm = Enzyme.make_zero(rmodel)
 tg = @elapsed cg = Reactant.@compile compile_options=options grad!(rmodel, dm, wr)
 cg(rmodel, dm, wr)
 ad = Array(interior(dm.microphysical_fields.qᵛ))
-floor = 1e-6 * maximum(abs, ad)
+qr = Array(interior(μ.ρqʳ))
+nan_ad = .!isfinite.(ad)
+note("AD finiteness"; nonfinite=count(nan_ad), nonfinite_cloudy=count(nan_ad .& cloudy), nonfinite_rain=count(nan_ad .& (qr .> 0)),
+     levels=sort(unique(getindex.(Tuple.(findall(nan_ad)), 3))))
+floor = 1e-6 * maximum(abs, filter(isfinite, ad); init=0.0)
+fds = Dict{Float64, Array{Float64, 3}}()
 best = fill(Inf, size(ad))
 for ε in (1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8)
-    err = abs.(fd_cells(ε) .- ad) ./ (abs.(ad) .+ floor)
+    fds[ε] = fd = fd_cells(ε)
+    note("fd finiteness"; ε, nonfinite=count(!isfinite, fd))
+    err = abs.(fd .- ad) ./ (abs.(ad) .+ floor)
+    err[.!isfinite.(err)] .= Inf
     global best = min.(best, err)
     frac(m) = count(err[m] .< 1e-3) / max(count(m), 1)
     note("fd"; ε, median_error=sort(vec(err))[end ÷ 2], within_1e3_all=frac(trues(size(err))),
          within_1e3_cloudy=frac(cloudy), within_1e3_clear=frac(.!cloudy))
 end
-bad = findall(best .> 1e-3)
+bad = findall(.!(best .<= 1e-3))
+serialize(joinpath(get(ENV, "ATLANTIC_OUTPUT", "outputs"), "p3_gradient.jls"), (; ad, fds, base, qc, qr, weights))
 note("P3 reverse"; compile_seconds=tg, cells=length(ad), cloudy_cells=count(cloudy), bad_cells=length(bad), bad_cloudy=count(cloudy[bad]),
-     max_abs_ad=maximum(abs, ad))
-for c in bad[sortperm(best[bad], rev=true)][1:min(10, end)]
-    println("bad cell ", Tuple(c), " ad=", ad[c], " best_rel=", best[c], " qv=", base[c], " ρqcl=", qc[c])
+     max_abs_finite_ad=maximum(abs, filter(isfinite, ad); init=0.0))
+for c in bad[1:min(10, end)]
+    println("bad cell ", Tuple(c), " ad=", ad[c], " fd(1e-6)=", fds[1e-6][c], " best_rel=", best[c], " qv=", base[c], " ρqcl=", qc[c], " ρqr=", qr[c])
 end
 println(isempty(bad) ? "P3_GRADIENT_PASS" : "P3_GRADIENT_FAIL", " bad_cells=$(length(bad))/$(length(ad)) compile_s=$tg")

@@ -161,3 +161,14 @@ the same IC. The quantity is the maximum over levels of the per-level RMS differ
 - Test: an isolated, algebraically identical stable form (Breeze worktree `stable-rain-share-test`,
   a6228574). It is validated against BigFloat first (job 16583), then used for one matched early-trajectory
   comparison. Production is unchanged.
+- Stable-form check (job 16587, isolated `Breeze-stable` a6228574):
+  - φ(a) is within 2.1 ulp of BigFloat-256 over a ∈ [1e-20, 1e3].
+  - Growth expression vs BigFloat (1e5 inputs, a ∈ 1e-12..1e-2): the original has median relative error
+    1.2e-4 and worst 9.8e10; the stable form has median 9e-17 and worst 6e-13.
+  - Change in the P3 tendencies: ρqʳ ≤ 1.4e-8 relative, cloud ≤ 4e-16. The change is confined to the
+    cancellation and is not bit-exact.
+- Matched early trajectory with the stable form (job 16588, same IC): ρqʳ now responds linearly.
+  Δ(1e-3)/Δ(1e-6) = 1000 at every step to 300 s, and the subcloud ε-independent floor is gone. The residual
+  floor at ε ≤ 1e-9 is about 100× lower, consistent with θ's per-step representability. This indicates the
+  production rain jump floor came from the rain-share cancellation. Isolated test only; production is
+  unchanged.

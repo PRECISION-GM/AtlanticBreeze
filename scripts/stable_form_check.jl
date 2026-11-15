@@ -18,18 +18,16 @@ println("label=", label, " stable_form_defined=", stable, " breeze=", pkgdir(Bre
 if stable
     φexact(a::BigFloat) = 1 - (1 - exp(-a)) / a
     ulps(x, ref) = Float64(abs(BigFloat(x) - ref) / eps(Float64(ref)))
-    worst = 0.0; worst_a = 0.0
-    for a in exp10.(range(-20, 3; length=20001))
-        e = ulps(PPP.transient_deficit(a), φexact(BigFloat(a)))
-        e > worst && (worst = e; worst_a = a)
-    end
+    grid = exp10.(range(-20, 3; length=20001))
+    errors = [ulps(PPP.transient_deficit(a), φexact(BigFloat(a))) for a in grid]
+    worst, i = findmax(errors); worst_a = grid[i]
     near = maximum(ulps(PPP.transient_deficit(a), φexact(BigFloat(a))) for a in (prevfloat(1.0), 1.0, nextfloat(1.0), 0.999, 1.001))
     println(@sprintf("phi: max error %.2f ulp at a=%.3e over [1e-20,1e3]; around a=1: %.2f ulp", worst, worst_a, near))
 
     old(ε, ξ, ext, x, vx, T) = (ext * (ε / x) + (vx - ext / x) * (ε / x) * T) / ξ
     Random.seed!(2)
     errs_old = Float64[]; errs_new = Float64[]
-    for _ in 1:100000
+    for _ in 1:100000  # push! into existing arrays: no global rebinding
         a = exp10(-12 + 10rand()); τ = exp10(rand() * 2); x = a / τ
         ε = x * rand(); ξ = 1 + rand(); ext = (rand() - 0.5) * exp10(-10 + 4rand()); vx = (rand() - 0.5) * exp10(-8 + 4rand())
         ref = (ext * BigFloat(ε) / x * (1 - (1 - exp(-BigFloat(x) * τ)) / (BigFloat(x) * τ)) +

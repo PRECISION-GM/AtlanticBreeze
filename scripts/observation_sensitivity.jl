@@ -23,7 +23,9 @@
 # ENV: ATLANTIC_INPUT (production interval, forcing SHA checked), ATLANTIC_OUTPUT, ATLANTIC_NX (16),
 #      ATLANTIC_DX (200), ATLANTIC_WINDOW_START (7200 s), ATLANTIC_WINDOW (5400 s),
 #      ATLANTIC_DIRECTIONS (heating,moistening; also sst, sst_knot:<time_s>), ATLANTIC_EPSILONS (1,0.3,0.1),
-#      ATLANTIC_STATE (reuse a window state written by an earlier run), ATLANTIC_TARGETS.
+#      ATLANTIC_STATE (reuse a window state written by an earlier run), ATLANTIC_TARGETS,
+#      ATLANTIC_RECORD_STEPS (record cadence, default 60 s; e.g. 1 with a short ATLANTIC_WINDOW for early-
+#      trajectory diagnosis, where the MA30 loss is undefined and only the divergence diagnostics are meaningful).
 include("model.jl")
 using Oceananigans: prognostic_fields
 using Oceananigans.TimeSteppers: update_state!
@@ -98,7 +100,7 @@ function run_window(perturb; keep=false, reference=nothing)
     end
     simulation = Simulation(m; Δt=dt, stop_time=t0 + window)
     add_callback!(simulation, case.refresh!, IterationInterval(1))
-    add_callback!(simulation, record, IterationInterval(round(Int, 60 / dt)))
+    add_callback!(simulation, record, IterationInterval(parse(Int, get(ENV, "ATLANTIC_RECORD_STEPS", string(round(Int, 60 / dt))))))
     record(simulation); t_run = time(); run!(simulation); CUDA.synchronize(); t_run = time() - t_run; record(simulation)
     # build includes model construction (and native JIT on the first run); run is the synchronized window
     # integration (it includes native JIT of the time step on the first run only; later runs are warm).

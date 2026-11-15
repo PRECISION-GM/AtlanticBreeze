@@ -54,11 +54,13 @@ None of these represents the 12.8 km production domain.
 - Reproducibility: in every job, re-running the baseline gives ΔJ = 0 and max ΔLWP = 0 (bitwise).
 - The LWP-term slopes are small and stable (|d/dε| ≤ 0.015). The DWP term carries all the drift.
 - Mask audit at ε = 0.003 (1456 transect column-times):
-  - heating: 0 cloud-base switches and 0 cloudy/clear switches, yet J(+ε) and J(−ε) are both below J0
-    (increments −1.46e-3 and +0.09e-3, second difference −152);
+  - heating: 0 cloud-base switches and 0 cloudy/clear switches. J(+ε) = J0 − 1.4636e-3 (below J0) and
+    J(−ε) = J0 + 9.383e-5 (above J0). The response is strongly asymmetric, with second difference −152.
+    (Correction: an earlier version said both were below J0. The audit field `down` is J0 − J(−ε), and it is
+    negative here.) The central slope −0.2596 is unaffected;
   - moistening: 3 base switches;
   - SST: 12–73 base switches.
-  Mask switching therefore cannot explain the heating behaviour. The trajectory diagnosis (job 16578)
+  Mask switching therefore cannot explain the heating asymmetry. The trajectory diagnosis (job 16578)
   tests reproducibility at nonzero controls and the divergence floor at ε = 1e-6 and 1e-9.
 - Conclusion so far: no direction has a validated plateau. The n16 heating value of ≈ −0.285 over
   ε = 0.1–0.01 did not persist at 0.003 (−0.260). SST changes sign with ε. Descent is not attempted.
@@ -110,3 +112,37 @@ n16, building the Reactant model took 1967 s, compiling the kernel 46–56 s and
   - 16570–16572: timing. 16578: trajectory diagnosis.
 - Targets: `~/AtlanticBreeze-data/paper-gradient-targets` (digitized traces of Ghate & Cadeddu 2019, Fig. 2;
   not original retrievals).
+
+## Trajectory diagnosis (job 16578, 46fc106, n16, same window state)
+- Zero perturbation (heating 0): ΔJ = 0 and zero field divergence at every minute.
+- Two independent heating +0.003 runs are identical in J and in every divergence diagnostic, so runs with
+  a nonzero control are reproducible.
+- Response ΔJ_frozen for each direction (the DWP term dominates in every case):
+
+  | direction | ε | ΔJ_frozen |
+  |---|---|---|
+  | heating | +0.003 | −1.464e-3 |
+  | heating | −0.003 | +9.38e-5 |
+  | heating | 1e-6 | +1.90e-4 |
+  | heating | 1e-9 | +2.62e-6 |
+  | moistening | 1e-9 | +1.00e-5 |
+  | SST | 1e-9 | −5.20e-5 |
+
+- ΔJ/ε grows as ε shrinks (heating): 0.49 per unit at 0.003 (central slope 0.26 in magnitude), 190 at 1e-6, 2.6e3 at 1e-9. The response is not
+  linear in ε over this range.
+- Per-level RMS Δρqʳ (maximum over levels) after the first minute:
+
+  | ε | 9 min | 29 min | 59 min | 90 min |
+  |---|---|---|---|---|
+  | 0.003 | 8.2e-11 | 7.7e-10 | 2.7e-8 | 7.1e-8 |
+  | 1e-6 | 7.6e-13 | 6.3e-10 | 2.2e-8 | 2.8e-8 |
+  | 1e-9 | 7.9e-13 | 7.7e-10 | 1.3e-8 | 1.9e-8 |
+
+  By about 30 min the divergence no longer depends on ε, across 6.5 decades.
+- Divergence of all four tracked fields (ρqᶜˡ, ρqʳ, w, θ) first appears at the second record (1 min).
+- Interpretation: perturbations are amplified quickly and reproducibly up to a common, ε-independent
+  amplitude well before the end of the 90-min window. That makes the central FD of J over this window
+  non-convergent in ε. This shows strong amplification of tiny perturbations. It does not prove that no
+  mathematical derivative exists, nor that a noise floor is irreducible, and it does not identify the
+  mechanism (P3 cancellation, dynamical growth, or both). Next: per-step early trajectory, to find where
+  linear scaling Δ ∝ ε first breaks and at which level.

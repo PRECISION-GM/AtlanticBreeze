@@ -50,17 +50,19 @@ utc(t) = 11.5 + t / 3600   # hours UTC; t is seconds since the 11:30 UTC launch
 if isfile(state_file)
     saved = deserialize(state_file)
     (saved.nx, saved.dx, saved.time, saved.forcing_sha) == (nx, dx, t0, PRODUCTION_FORCING_SHA) || error("State file is for another configuration")
+    get(saved, :dynamics, "anelastic") == get(ENV, "ATLANTIC_DYNAMICS", "anelastic") || error("State file is for dynamics $(get(saved, :dynamics, "anelastic"))")
 else
     case = make_case(input; nx, dx)
     simulation = Simulation(case.model; Δt=dt, stop_time=t0)
     add_callback!(simulation, case.refresh!, IterationInterval(1))
     wall = @elapsed run!(simulation)
     m = case.model
-    saved = (; nx, dx, order=case.order, time=m.clock.time, iteration=m.clock.iteration, forcing_sha=PRODUCTION_FORCING_SHA,
+    saved = (; nx, dx, order=case.order, time=m.clock.time, iteration=m.clock.iteration, forcing_sha=PRODUCTION_FORCING_SHA, dynamics=string(case.dynamics),
                wall, fields=Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(m))))
     serialize(state_file, saved)
     note("spinup"; nx, dx, t0, wall)
 end
+get(ENV, "ATLANTIC_SPINUP_ONLY", "false") == "true" && (println("SPINUP_DONE ", state_file); exit())
 
 # 2. One window run with a given forcing perturbation; records every 60 s of model time.
 # reference: per-record 3D snapshots of a baseline run; when given, each record also stores the per-level

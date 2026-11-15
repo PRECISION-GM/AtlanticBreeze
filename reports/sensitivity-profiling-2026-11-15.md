@@ -187,3 +187,23 @@ remains stable (heating ≈ −0.0034, moistening ≈ 0.008); the DWP term is wh
 frozen wherever mask switches are nonzero. Conclusion: the stable form removes the step-2 ρqʳ floor (16588) but is not
 sufficient for a converged 90-min derivative; the remaining small-ε scatter is consistent with nonlinear/chaotic
 amplification of the DWP rain proxy over the window. No direction is validated; no descent performed.
+
+## Job 16660: onset of nonlinearity in the stable-env 90-min trajectory (scripts/trajectory_onset.jl)
+
+Stable env (Breeze-stable a6228574), n16, same IC; baseline + heating ±0.01, ±0.001, ±1e-4; records every 60 s.
+Odd part = (run(+ε) − run(−ε))/2ε per record; rain RMS divergence normalized by ε.
+
+- 0–22 min: linear. Signed central-difference series of raw transect DWP and domain LWP agree across the three
+  pairs to ≲3% at every record; max-level RMS Δρqʳ/ε agrees to ~10% (e.g. 20 min: 1.25e-7/1.12e-7/1.42e-7).
+- Rain state breaks first: per-level onset (first record with RMSΔ(1e-3)/RMSΔ(1e-4) < 5) is records 24–28
+  (≈23–27 min) at subcloud levels 1–27, then records 31–37 at levels 28–48 (cloud layer). From ~26 min the
+  1e-4 run's Δρqʳ/ε exceeds the 1e-3 run's (30 min: 6.9e-7 vs 2.1e-5), i.e. an ε-independent component grows in rain.
+- Raw DWP odd part departs at ~30 min (−.0235/−.0319/−.0329) and loses sign consistency by 40 min (1e-4: +0.67).
+- θ, w and ρqᶜˡ stay linear (ratio ≈10) through 30 min and break at record 39 (38 min).
+- LWP odd part agrees to ~4% through 45–50 min, diverges from ~55 min.
+- Cloud-base mask switches: 0 at nearly every record, ≤1 anywhere, for all six runs. The onset is not a mask or
+  DWP-integration branch event; it originates in the rain state, subcloud, ~10–15 min before the dynamics.
+- The MA30 loss (first hour excluded) samples 60–90 min, entirely after onset; this is why the window FD has no plateau.
+- Levels ≥51 show ratio<5 from record 2: trace rain at roundoff above cloud (boundary cells, reported separately).
+- Not established: the mechanism of the ε-independent rain component (candidates: remaining non-smooth rain
+  branches such as tiny-mass/sink limiters at qʳ≈0, or a further primal floor). Not claimed as chaos.

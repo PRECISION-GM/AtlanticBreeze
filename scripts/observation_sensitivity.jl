@@ -210,7 +210,8 @@ if !isempty(trajectory_runs)
         first_div = Dict(f => something(findfirst(x -> maximum(x[f]) > 0, d), 0) for f in String.(TRACKED))
         push!(results["trajectory"], (; label=spec, ε, J_frozen=t["J_frozen"], J_moving=t["J_moving"], lwp_term=t["lwp_term"],
               dwp_term=t["dwp_term_frozen"], lwp=r.lwp, dwp_frozen=dwp_raw(r, frozen_base), contrib=contrib(t),
-              divergence=d, first_divergent_record=first_div, switches=count(r.base .!= frozen_base)))
+              divergence=d, first_divergent_record=first_div, switches=count(r.base .!= frozen_base),
+              base=r.base, switches_by_record=vec(count(r.base .!= frozen_base; dims=1)), rain_transect=r.rain))
         save()
         growth = [maximum(x["ρqʳ"]) for x in d]
         println("traj ", spec, " ΔJ_frozen=", t["J_frozen"] - base_terms["J_frozen"], " ΔJ_moving=", t["J_moving"] - base_terms["J_moving"],

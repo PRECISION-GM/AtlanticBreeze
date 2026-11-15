@@ -5,7 +5,10 @@
 # It first checks that the CPU primal tendencies equal the native GPU kernel's, over the whole field.
 # Scope: one weighted vapour partial of one kernel; not the full Jacobian, nor full-case gradients.
 # ENV: ATLANTIC_STATE, ATLANTIC_GRADIENT_FILE (p3_gradient.jls), ATLANTIC_DX, ATLANTIC_OUTPUT, ATLANTIC_CELLS
-#      ("i,j,k;i,j,k", default: the three worst disagreeing cells and one agreeing rain cell).
+#      ("i,j,k;i,j,k", default: the three worst disagreeing cells and one agreeing rain cell),
+#      ATLANTIC_SKIP_GPU=1 (skip the GPU primal parity), ATLANTIC_FLUSH=1 (flush-to-zero test: after the
+#      original pass, set every subnormal microphysical input at the cell to 0, as a GPU flush-to-zero mode
+#      would, and repeat the chain; the original values are restored afterwards).
 using Enzyme
 include("model.jl")
 using Oceananigans: prognostic_fields
@@ -39,8 +42,8 @@ end
 # 1. Primal parity: the CPU cell replay must reproduce the native GPU kernel before any attribution.
 model = build(CPU())
 cpu = p3!(model)
-gpu = p3!(build(GPU()))
-for n in sort(collect(keys(cpu)))
+gpu = get(ENV, "ATLANTIC_SKIP_GPU", "0") == "1" ? Dict{String, Array{Float64, 3}}() : p3!(build(GPU()))
+for n in sort(collect(keys(gpu)))
     d = maximum(abs.(cpu[n] .- gpu[n])); s = maximum(abs, gpu[n])
     println(@sprintf("primal CPU-vs-GPU %-6s max|Δ|=%.3e max|G|=%.3e rel=%.3e", n, d, s, d / max(s, floatmin())))
 end
@@ -119,15 +122,17 @@ ad = g.ad; floor_ = 1e-6 * maximum(abs, filter(isfinite, ad))
 best = reduce((a, b) -> min.(a, b), [abs.(f .- ad) ./ (abs.(ad) .+ floor_) for f in values(g.fds)])
 bad = filter(c -> isfinite(ad[c]) && !(best[c] <= 1e-3), CartesianIndices(ad)); bad = bad[sortperm(best[bad], rev=true)]
 good = filter(c -> g.qr[c] > 0 && best[c] < 1e-6 && ad[c] != 0, CartesianIndices(ad))
-cells = haskey(ENV, "ATLANTIC_CELLS") ? [CartesianIndex(parse.(Int, split(s, ","))...) for s in split(ENV["ATLANTIC_CELLS"], ";")] :
+nancells = findall(.!isfinite.(ad))
+cells = get(ENV, "ATLANTIC_CELLS", "") == "nan" ? vcat(nancells[1:min(2, end)], nancells[end:end]) :
+        haskey(ENV, "ATLANTIC_CELLS") ? [CartesianIndex(parse.(Int, split(s, ","))...) for s in split(ENV["ATLANTIC_CELLS"], ";")] :
         vcat(bad[1:min(3, end)], good[1:min(1, end)])
 
 εs = (1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12)
 rows = []
-for c in cells
+function probe(c, label)
     i, j, k = Tuple(c); q0 = Array(interior(μ.qᵛ))[i, j, k]
     base = chain(q0, ctx, i, j, k)
-    println("\n== cell ", (i, j, k), " q0=", q0, " ρqʳ=", g.qr[c], " ρqᶜˡ=", g.qc[c], " saved reactant ad=", ad[c])
+    println("\n== ", label, " cell ", (i, j, k), " q0=", q0, " ρqʳ=", g.qr[c], " ρqᶜˡ=", g.qc[c], " saved reactant ad=", ad[c])
     for n in keys(base)
         a = Enzyme.autodiff(Enzyme.set_runtime_activity(Enzyme.Forward), component, Enzyme.Duplicated(q0, 1.0),
                             Enzyme.Const(ctx), Enzyme.Const(i), Enzyme.Const(j), Enzyme.Const(k), Enzyme.Const(Val(n)))[1]
@@ -138,8 +143,21 @@ for c in cells
         scale = max(abs(a), maximum(abs, fd), floatmin())
         println(@sprintf("%-30s value=% .6e enzyme=% .6e fd(1e-8)=% .6e fd(1e-10)=% .6e left=% .4e right=% .4e |Δ|/scale=%.2e",
                          n, base[n], a, fd[4], fd[6], left, right, abs(a - fd[4]) / scale))
-        push!(rows, (; cell=(i, j, k), name=n, value=base[n], enzyme=a, fd=collect(zip(εs, fd)), left, right))
+        push!(rows, (; label, cell=(i, j, k), name=n, value=base[n], enzyme=a, fd=collect(zip(εs, fd)), left, right))
     end
+end
+for c in cells
+    probe(c, "original")
+    get(ENV, "ATLANTIC_FLUSH", "0") == "1" || continue
+    flushed = Pair{Symbol, Float64}[]
+    for (n, f) in pairs(μ)
+        f isa Oceananigans.AbstractField && ndims(interior(f)) == 3 && size(interior(f), 3) >= c[3] || continue
+        v = f[c[1], c[2], c[3]]
+        if issubnormal(v); push!(flushed, n => v); f[c[1], c[2], c[3]] = 0.0; end
+    end
+    println("\nflushed subnormal inputs at ", Tuple(c), ": ", flushed)
+    isempty(flushed) || probe(c, "flushed")
+    for (n, v) in flushed; μ[n][c[1], c[2], c[3]] = v; end
 end
 serialize(joinpath(output, "p3_chain.jls"), rows)
 println("P3_CHAIN_DONE")

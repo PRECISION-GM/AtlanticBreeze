@@ -172,3 +172,18 @@ the same IC. The quantity is the maximum over levels of the per-level RMS differ
   floor at ε ≤ 1e-9 is about 100× lower, consistent with θ's per-step representability. This indicates the
   production rain jump floor came from the rain-share cancellation. Isolated test only; production is
   unchanged.
+
+## Job 16590: 90-min FD with the stable rain share (isolated env-stable, n16, same IC/masks)
+
+| dir | ε=0.1 | 0.03 | 0.01 | 0.003 | 0.001 | (frozen dJ/dε) |
+|---|---|---|---|---|---|---|
+| heating | −.284 | −.277 | −.262 | −.135 | −.168 | |
+| moistening | .767 | .709 | .718 | .649 | .931 | |
+| sst | .615 | .790 | .777 | .118 | −.025 | |
+
+Production (frozen): heating −.287/−.284/−.287/−.260 at .1/.03/.01/.003; moistening .767/.709/.695/.621; sst .616/.790/.779/.158.
+The large-ε values are essentially unchanged; the small-ε values still fail to plateau (worse for heating). The LWP term
+remains stable (heating ≈ −0.0034, moistening ≈ 0.008); the DWP term is what drifts. Moving-mask values differ from
+frozen wherever mask switches are nonzero. Conclusion: the stable form removes the step-2 ρqʳ floor (16588) but is not
+sufficient for a converged 90-min derivative; the remaining small-ε scatter is consistent with nonlinear/chaotic
+amplification of the DWP rain proxy over the window. No direction is validated; no descent performed.

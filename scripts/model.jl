@@ -20,7 +20,8 @@ const ENA_COORDINATE = (-28.0257, 39.0916)  # (longitude, latitude) of the ARM E
 
 function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1,
                    order=advection_order(), dx=nothing, solar_position=nothing, lookup_search=nothing,
-                   forcing_perturbation=identity)
+                   forcing_perturbation=identity, dynamics=Symbol(get(ENV, "ATLANTIC_DYNAMICS", "anelastic")))
+    dynamics in (:anelastic, :split_explicit) || error("ATLANTIC_DYNAMICS must be anelastic or split_explicit")
     config = TOML.parsefile(joinpath(input, "interval.toml"))
     isnothing(nx) && (nx = config["nx"])
     isnothing(dx) && (dx = grid_spacing(get(config, "dx", 100.0)))
@@ -81,21 +82,41 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         # Radiation sees a continued column above the 8 km LES top: 40 layers to 65 km, standard-atmosphere
         # T/q anchored to the grid-top temperature, and the background standard ozone profile.
         overlying_atmosphere=OverlyingAtmosphereColumn(Float64; top=65e3, layers=40))
-    model=AtmosphereModel(grid; dynamics=AnelasticDynamics(reference),formulation=:LiquidIcePotentialTemperature,
+    # Split-explicit compressible: Breeze's SplitExplicitTimeDiscretization (WS-RK3 outer, acoustic
+    # substeps from acoustic_cfl unless ATLANTIC_SUBSTEPS is given, thermal divergence damping 0.1) on an
+    # Exner reference built from the same sounding θ and qᵗ profiles and surface pressure. The anelastic
+    # reference above still supplies the column density used by forcing/aerosol/surface-flux conversions.
+    substeps = haskey(ENV, "ATLANTIC_SUBSTEPS") ? parse(Int, ENV["ATLANTIC_SUBSTEPS"]) : nothing
+    dyn = dynamics === :anelastic ? AnelasticDynamics(reference) :
+        CompressibleDynamics(SplitExplicitTimeDiscretization(; substeps); base_pressure=profiles.surface_pressure,
+            reference_potential_temperature=z -> profiles(:θ, z), reference_vapor_mass_fraction=z -> profiles(:qᵗ, z))
+    model=AtmosphereModel(grid; dynamics=dyn,formulation=:LiquidIcePotentialTemperature,
         microphysics,radiation,forcing=L.compact_forcing(forcing),boundary_conditions,thermodynamic_constants=constants,
         coriolis=FPlane(f=9.19626e-5),closure=nothing,momentum_advection=WENO(; order),
         scalar_advection=L.scalar_advection_schemes(order,microphysics,:qᵛ))
     state=L.initial_state_columns(profiles,z,pressure;constants)
     # The observations are dry theta, not Breeze liquid-ice theta. Initialize via T.
     state=merge(state,(;T_condensate_free=initial[:,3].*(pressure./1e5).^0.2857))
-    L.set_sounding_initial_state!(model,state;perturbation=L.InitialPerturbation(;seed=3042016),
-        moisture_basis=:mass_fraction,initialization=:condensate_free)
+    perturbation=L.InitialPerturbation(;seed=3042016)
+    if dynamics === :anelastic
+        L.set_sounding_initial_state!(model,state;perturbation,moisture_basis=:mass_fraction,initialization=:condensate_free)
+    else
+        # Same perturbed condensate-free T, qᵛ, u, v as set_sounding_initial_state!, plus a total density
+        # in pressure balance with the model's own Exner reference pressure: ρ = p_ref / (Rᵐ T₀).
+        Nz=length(z); col(v)=reshape(v,1,1,Nz)
+        ϵ=L.perturbation_array(nx,nx,z,perturbation); δT,δq=L.perturbation_amplitudes(perturbation,z)
+        T₀=col(state.T_condensate_free).+col(δT).*ϵ; qᵛ₀=max.(0,col(state.qᵗ).+col(δq).*ϵ)
+        Rd=Breeze.Thermodynamics.dry_air_gas_constant(constants); Rv=Breeze.Thermodynamics.vapor_gas_constant(constants)
+        p_ref=col(Array(interior(model.dynamics.reference_state.pressure,1,1,:)))
+        ρ₀=p_ref./((Rd.*(1 .-qᵛ₀).+Rv.*qᵛ₀).*T₀)
+        set!(model; ρ=ρ₀, T=T₀, qᵛ=qᵛ₀, u=repeat(col(state.u),nx,nx,1), v=repeat(col(state.v),nx,nx,1))
+    end
     # Host interpolation gives set! a scalar, avoiding the GPU-indexing closure in the example.
     function refresh!(sim)
         set!(surface_temperature,L.interpolate_profile(times,sst_values,sim.model.clock.time))
         fill_halo_regions!(surface_temperature)
     end
-    return (;model,config,z,faces,pressure,density,refresh!,taper,order,dx,radiation_iterations)
+    return (;model,config,z,faces,pressure,density,refresh!,taper,order,dx,radiation_iterations,dynamics)
 end
 
 # Domain-mean profiles (theta, qv, cloud and total liquid, cloud fraction, w variance), the LWP map and
@@ -146,7 +167,7 @@ function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothin
     meta=Dict{String,Any}("duration"=>duration,"complete_interval"=>false,"loss"=>NaN,
         "temperature_correction_Kday"=>controls[1],"moisture_correction_gkgday"=>controls[2],"nx"=>size(model.grid,1),"dx_m"=>case.dx,"domain_m"=>size(model.grid,1)*case.dx,"order"=>case.order,"halo"=>collect(advection_halo(case.order)),
         "input"=>abspath(input),"precision"=>"Float64","aerosol"=>"prognostic","aerosol_setting"=>string(aerosol_setting),
-        "dt"=>config["dt"],"advection"=>"WENO$(case.order) momentum and scalars","closure"=>"none (implicit WENO dissipation)","commit"=>get(ENV,"ATLANTIC_COMMIT","unknown"))
+        "dt"=>config["dt"],"dynamics"=>string(case.dynamics),"substeps"=>get(ENV,"ATLANTIC_SUBSTEPS","auto (acoustic_cfl 0.5)"),"advection"=>"WENO$(case.order) momentum and scalars","closure"=>"none (implicit WENO dissipation)","commit"=>get(ENV,"ATLANTIC_COMMIT","unknown"))
     writemeta()=open(io->TOML.print(io,meta),joinpath(output,"run.toml"),"w")
     writemeta()  # Records an incomplete run until the end is reached.
     simulation=Simulation(model;Δt=config["dt"],stop_time=duration)

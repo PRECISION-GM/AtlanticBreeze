@@ -181,7 +181,16 @@ for name in directions, ε in epsilons
     rp = run_window(direction(name, ε)); rm = run_window(direction(name, -ε))
     push!(timings, timing(rp, "$name +$ε")); push!(timings, timing(rm, "$name -$ε"))
     plus, _ = evaluate(rp, frozen_base, masks); minus, _ = evaluate(rm, frozen_base, masks)
-    row = Dict{String, Any}("plus" => plus, "minus" => minus)
+    # Mask audit: transect cells (column × time) whose cloud-base index, or cloudy/clear status, differs from
+    # the baseline. The frozen policy ignores these switches; the moving policy sees them. (P3 limiter and
+    # other internal branch switches are not counted here.)
+    switches(r) = (; base=count(r.base .!= frozen_base), cloudy=count((r.base .> 0) .!= (frozen_base .> 0)), total=length(frozen_base))
+    row = Dict{String, Any}("plus" => plus, "minus" => minus, "switches_plus" => switches(rp), "switches_minus" => switches(rm))
+    # Taylor audit about the baseline J0: one-sided increments and the symmetric (second-order) residual.
+    for key in ("J_frozen", "J_moving")
+        J0 = base_terms[key]
+        row["taylor_$key"] = (; up=plus[key] - J0, down=J0 - minus[key], second=(plus[key] - 2J0 + minus[key]) / ε^2)
+    end
     for key in ("J_frozen", "J_moving", "lwp_term", "dwp_term_frozen", "dwp_term_moving")
         row["d$key"] = (plus[key] - minus[key]) / 2ε
     end
@@ -189,7 +198,9 @@ for name in directions, ε in epsilons
     unit = get(units, split(name, ":")[1], "K")
     println("FD ", name, " ε=", ε, " [", unit, "] dJ_frozen/dε=", row["dJ_frozen"], " dJ_moving/dε=", row["dJ_moving"],
             " dLWPterm=", row["dlwp_term"], " dDWPterm_frozen=", row["ddwp_term_frozen"],
-            " J+=", plus["J_frozen"], " J-=", minus["J_frozen"], " pair_wall_s=", rp.wall + rm.wall); flush(stdout)
+            " J+=", plus["J_frozen"], " J-=", minus["J_frozen"], " pair_wall_s=", rp.wall + rm.wall)
+    println("audit ", name, " ε=", ε, " switches+=", row["switches_plus"], " switches-=", row["switches_minus"],
+            " taylor_frozen=", row["taylor_J_frozen"], " taylor_moving=", row["taylor_J_moving"]); flush(stdout)
 end
 for t in timings; println("timing ", t); end
 println("OBSERVATION_SENSITIVITY_DONE directions=", join(directions, ","), " epsilons=", epsilons)

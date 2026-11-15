@@ -146,3 +146,18 @@ n16, building the Reactant model took 1967 s, compiling the kernel 46–56 s and
   mathematical derivative exists, nor that a noise floor is irreducible, and it does not identify the
   mechanism (P3 cancellation, dynamical growth, or both). Next: per-step early trajectory, to find where
   linear scaling Δ ∝ ε first breaks and at which level.
+
+## Early-trajectory diagnosis (job 16580, a0f22f2; analysis `scripts/early_divergence.jl`)
+The first 600 s of the window, recorded every 1 s step, for heating ε = 1e-3, 1e-6, 1e-9 and 1e-12, all from
+the same IC. The quantity is the maximum over levels of the per-level RMS difference from the baseline.
+- θ, w and ρqᶜˡ respond linearly: Δ(1e-3)/Δ(1e-6) = 1000 throughout. For θ, ε = 1e-9 and 1e-12 are
+  below its per-step Float64 resolution.
+- ρqʳ does not respond linearly. From step 2, Δρqʳ ≈ 1.3–5e-16 for ε = 1e-6, 1e-9 and 1e-12 alike, at
+  subcloud levels 8–22. That is a perturbation-independent jump of about 1e-6 relative to the local rain,
+  far above ρqʳ round-off.
+- These are the levels where catastrophic cancellation in the P3 rain share was found at kernel level.
+  The match is consistent with that cancellation as the source, but does not prove it.
+- The DWP loss is built from rain, so this floor enters J directly.
+- Test: an isolated, algebraically identical stable form (Breeze worktree `stable-rain-share-test`,
+  a6228574). It is validated against BigFloat first (job 16583), then used for one matched early-trajectory
+  comparison. Production is unchanged.

@@ -67,8 +67,9 @@ function run_window(perturb)
     m = case.model; grid = m.grid; dz = diff(case.faces); nz = length(dz); j = nx ÷ 2
     for (n, f) in pairs(prognostic_fields(m)); set!(f, saved.fields[String(n)]); end
     m.clock.time = saved.time; m.clock.iteration = saved.iteration
-    case.refresh!((; model=m)); update_state!(m)
-    times = Float64[]; lwp = Float64[]; base = Matrix{Int}(undef, nx, 0); rain = Array{Float64}(undef, nx, nz, 0)
+    case.refresh!((; model=m)); update_state!(m); CUDA.synchronize()
+    build = time() - wall0
+    times = Float64[]; lwp = Float64[]; cfl = Float64[]; base = Matrix{Int}(undef, nx, 0); rain = Array{Float64}(undef, nx, nz, 0)
     function record(sim)
         t = sim.model.clock.time
         (!isempty(times) && t <= times[end]) && return
@@ -77,6 +78,9 @@ function run_window(perturb)
         liquid = cloud .+ ρqr .+ Array(interior(w.ρqʷⁱ))
         value = 1000sum(vec(mean(liquid; dims=(1, 2))) .* dz)
         isfinite(value) || error("Nonfinite LWP at t=$t")
+        U = max(maximum(abs, interior(sim.model.velocities.u)), maximum(abs, interior(sim.model.velocities.v)))
+        c = dt * (2U / dx + maximum(abs, interior(sim.model.velocities.w)) / minimum(dz))
+        c < 0.8 || error("CFL $c exceeds 0.8 at t=$t"); push!(cfl, c)
         qc = cloud[:, j, :] ./ reshape(case.density, 1, :)
         kb = [something(findfirst(>(1e-5), qc[i, :]), 0) for i in 1:nx]   # 0: clear column
         push!(times, t); push!(lwp, value); base = hcat(base, kb); rain = cat(rain, ρqr[:, j, :]; dims=3)
@@ -84,8 +88,10 @@ function run_window(perturb)
     simulation = Simulation(m; Δt=dt, stop_time=t0 + window)
     add_callback!(simulation, case.refresh!, IterationInterval(1))
     add_callback!(simulation, record, IterationInterval(round(Int, 60 / dt)))
-    record(simulation); run!(simulation); record(simulation)
-    return (; times, lwp, base, rain, dz, wall=time() - wall0)
+    record(simulation); t_run = time(); run!(simulation); CUDA.synchronize(); t_run = time() - t_run; record(simulation)
+    # build includes model construction (and native JIT on the first run); run is the synchronized window
+    # integration (it includes native JIT of the time step on the first run only; later runs are warm).
+    return (; times, lwp, base, rain, dz, cfl_max=maximum(cfl), build, run=t_run, steps=round(Int, window / dt), wall=time() - wall0)
 end
 
 # DWP along the transect for given cloud-base indices (0 = clear; missing when no column is cloudy).
@@ -162,14 +168,19 @@ note("baseline"; wall=baseline.wall, J_frozen=base_terms["J_frozen"], J_moving=b
      cloudy_fraction=count(>(0), baseline.base) / length(baseline.base))
 repeat = run_window(identity); rep_terms, _ = evaluate(repeat, frozen_base, masks)
 note("baseline repeat"; ΔJ=rep_terms["J_frozen"] - base_terms["J_frozen"], max_Δlwp=maximum(abs, repeat.lwp .- baseline.lwp))
-results = Dict{String, Any}("baseline" => base_terms, "baseline_repeat_dJ" => rep_terms["J_frozen"] - base_terms["J_frozen"],
+timing(r, label) = Dict("label" => label, "build_s" => r.build, "run_s" => r.run, "wall_s" => r.wall, "steps" => r.steps,
+                         "s_per_step" => r.run / r.steps, "cfl_max" => r.cfl_max)
+timings = [timing(baseline, "baseline (cold: includes JIT)"), timing(repeat, "baseline repeat (warm)")]
+results = Dict{String, Any}("timings" => timings, "gpu" => CUDA.name(CUDA.device()), "cells" => nx * nx * length(baseline.dz),
+    "dt" => dt, "spinup_wall_s" => saved.wall, "baseline" => base_terms, "baseline_repeat_dJ" => rep_terms["J_frozen"] - base_terms["J_frozen"],
     "masks" => masks, "frozen_base" => frozen_base, "window" => (t0, t0 + window), "nx" => nx, "dx" => dx,
     "forcing_sha" => PRODUCTION_FORCING_SHA, "commit" => get(ENV, "ATLANTIC_COMMIT", "unknown"), "directions" => Dict())
 save() = serialize(joinpath(output, "observation_sensitivity.jls"), results)
 save()
 for name in directions, ε in epsilons
-    plus, _ = evaluate(run_window(direction(name, ε)), frozen_base, masks)
-    minus, _ = evaluate(run_window(direction(name, -ε)), frozen_base, masks)
+    rp = run_window(direction(name, ε)); rm = run_window(direction(name, -ε))
+    push!(timings, timing(rp, "$name +$ε")); push!(timings, timing(rm, "$name -$ε"))
+    plus, _ = evaluate(rp, frozen_base, masks); minus, _ = evaluate(rm, frozen_base, masks)
     row = Dict{String, Any}("plus" => plus, "minus" => minus)
     for key in ("J_frozen", "J_moving", "lwp_term", "dwp_term_frozen", "dwp_term_moving")
         row["d$key"] = (plus[key] - minus[key]) / 2ε
@@ -178,6 +189,7 @@ for name in directions, ε in epsilons
     unit = get(units, split(name, ":")[1], "K")
     println("FD ", name, " ε=", ε, " [", unit, "] dJ_frozen/dε=", row["dJ_frozen"], " dJ_moving/dε=", row["dJ_moving"],
             " dLWPterm=", row["dlwp_term"], " dDWPterm_frozen=", row["ddwp_term_frozen"],
-            " J+=", plus["J_frozen"], " J-=", minus["J_frozen"]); flush(stdout)
+            " J+=", plus["J_frozen"], " J-=", minus["J_frozen"], " pair_wall_s=", rp.wall + rm.wall); flush(stdout)
 end
+for t in timings; println("timing ", t); end
 println("OBSERVATION_SENSITIVITY_DONE directions=", join(directions, ","), " epsilons=", epsilons)

@@ -28,6 +28,7 @@ limits = [3.0, 2.0]
 isdir(output) && !isempty(readdir(output)) && error("Output directory is not empty: $output")
 mkpath(output)
 Reactant.set_default_backend("gpu")
+const T0 = time()
 # Failed pass pipelines dump their MLIR next to the results instead of node-local /tmp.
 Reactant.MLIR.IR.DUMP_MLIR_DIR[] = mkpath(joinpath(get(ENV, "ATLANTIC_OUTPUT", "outputs"), "mlir"))
 note(msg; kw...) = (@info msg kw...; flush(stderr))
@@ -132,17 +133,20 @@ fd = [(k, ε, (J([k == 1 ? ε : 0, k == 2 ? ε : 0]) - J([k == 1 ? -ε : 0, k ==
 # Construction runs eager operations on concrete Reactant arrays (e.g. the SAM sponge's initial horizontal
 # average), which index element by element. Scalar access is allowed for construction only; the compiled
 # programs below trace these operations instead.
+note("building Reactant model"; elapsed_s=time() - T0)
 rcase = with_large_stack(() -> CUDA.@allowscalar make_case(input; nx, dx, order, architecture=ReactantState(), solar_position, lookup_search))
 rmodel = rcase.model
 set!(rmodel.radiation.surface_radiation.surface_temperature, saved.sst)
 rinputs = window_inputs(ReactantState())
 x = Reactant.to_rarray(zeros(2)); dx_shadow = Reactant.to_rarray(zeros(2))
 options = Reactant.CompileOptions(raise=true, raise_first=true, sync=true, excluded_passes=["concat_insert_dim_elementwise"])
+note("compiling primal")
 primal_compile = @elapsed compiled_primal = with_large_stack(() ->
     Reactant.@compile compile_options=options window_objective(rmodel, x, rinputs, Δt, steps))
 Jc = Float64(compiled_primal(rmodel, x, rinputs, Δt, steps))
 parity = abs(Jc - J0) / abs(J0)
 note("compiled primal"; Jc, parity, primal_compile)
+note("compiling reverse gradient")
 dmodel = Enzyme.make_zero(rmodel)
 gradient_compile = @elapsed compiled_gradient = with_large_stack(() ->
     Reactant.@compile compile_options=options gradient!(rmodel, dmodel, x, dx_shadow, rinputs, Δt, steps))

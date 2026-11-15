@@ -61,7 +61,12 @@ else
 end
 
 # 2. One window run with a given forcing perturbation; records every 60 s of model time.
-function run_window(perturb)
+# reference: per-record 3D snapshots of a baseline run; when given, each record also stores the per-level
+# RMS difference from it (trajectory divergence by height and time).
+const TRACKED = (:ρqᶜˡ, :ρqʳ, :w, :θ)
+tracked(m) = (; ρqᶜˡ=Array(interior(m.microphysical_fields.ρqᶜˡ)), ρqʳ=Array(interior(m.microphysical_fields.ρqʳ)),
+               w=Array(interior(m.velocities.w))[:, :, 1:end-1], θ=Array(interior(m.temperature)))
+function run_window(perturb; keep=false, reference=nothing)
     wall0 = time()
     case = make_case(input; nx, dx, forcing_perturbation=perturb)
     m = case.model; grid = m.grid; dz = diff(case.faces); nz = length(dz); j = nx ÷ 2
@@ -69,7 +74,7 @@ function run_window(perturb)
     m.clock.time = saved.time; m.clock.iteration = saved.iteration
     case.refresh!((; model=m)); update_state!(m); CUDA.synchronize()
     build = time() - wall0
-    times = Float64[]; lwp = Float64[]; cfl = Float64[]; base = Matrix{Int}(undef, nx, 0); rain = Array{Float64}(undef, nx, nz, 0)
+    times = Float64[]; lwp = Float64[]; cfl = Float64[]; snaps = []; divergence = []; base = Matrix{Int}(undef, nx, 0); rain = Array{Float64}(undef, nx, nz, 0)
     function record(sim)
         t = sim.model.clock.time
         (!isempty(times) && t <= times[end]) && return
@@ -83,6 +88,12 @@ function run_window(perturb)
         c < 0.8 || error("CFL $c exceeds 0.8 at t=$t"); push!(cfl, c)
         qc = cloud[:, j, :] ./ reshape(case.density, 1, :)
         kb = [something(findfirst(>(1e-5), qc[i, :]), 0) for i in 1:nx]   # 0: clear column
+        snap = (keep || !isnothing(reference)) ? tracked(sim.model) : nothing
+        keep && push!(snaps, snap)
+        if !isnothing(reference)
+            r = reference[length(times) + 1]
+            push!(divergence, Dict(String(f) => vec(sqrt.(mean((getfield(snap, f) .- getfield(r, f)) .^ 2; dims=(1, 2)))) for f in TRACKED))
+        end
         push!(times, t); push!(lwp, value); base = hcat(base, kb); rain = cat(rain, ρqr[:, j, :]; dims=3)
     end
     simulation = Simulation(m; Δt=dt, stop_time=t0 + window)
@@ -91,7 +102,7 @@ function run_window(perturb)
     record(simulation); t_run = time(); run!(simulation); CUDA.synchronize(); t_run = time() - t_run; record(simulation)
     # build includes model construction (and native JIT on the first run); run is the synchronized window
     # integration (it includes native JIT of the time step on the first run only; later runs are warm).
-    return (; times, lwp, base, rain, dz, cfl_max=maximum(cfl), build, run=t_run, steps=round(Int, window / dt), wall=time() - wall0)
+    return (; times, lwp, base, rain, dz, snaps, divergence, cfl_max=maximum(cfl), build, run=t_run, steps=round(Int, window / dt), wall=time() - wall0)
 end
 
 # DWP along the transect for given cloud-base indices (0 = clear; missing when no column is cloudy).
@@ -160,7 +171,8 @@ function direction(name, ε)
 end
 units = Dict("heating" => "K/day (tapered)", "moistening" => "g/kg/day (tapered)", "sst" => "K")
 
-baseline = run_window(identity)
+trajectory_runs = get(ENV, "ATLANTIC_RUNS", "")   # e.g. "heating:0.003,heating:0.003,heating:1e-9": trajectory diagnosis mode
+baseline = run_window(identity; keep=!isempty(trajectory_runs))
 frozen_base = baseline.base
 base_terms, masks = evaluate(baseline, frozen_base, nothing)
 note("baseline"; wall=baseline.wall, J_frozen=base_terms["J_frozen"], J_moving=base_terms["J_moving"],
@@ -177,6 +189,37 @@ results = Dict{String, Any}("timings" => timings, "gpu" => CUDA.name(CUDA.device
     "forcing_sha" => PRODUCTION_FORCING_SHA, "commit" => get(ENV, "ATLANTIC_COMMIT", "unknown"), "directions" => Dict())
 save() = serialize(joinpath(output, "observation_sensitivity.jls"), results)
 save()
+# Trajectory diagnosis: single perturbed runs (repeats test reproducibility at nonzero controls), each with
+# its per-level divergence from the baseline, raw LWP/DWP series and per-time loss contributions saved.
+if !isempty(trajectory_runs)
+    dwp_raw(r, b) = dwp(r.rain, b, r.dz)
+    contrib(t) = (; L=((t["model_lwp_ma30"] .- t["paper_lwp_ma30"]) ./ 100) .^ 2,
+                    D=(t["model_dwp_ma30_frozen"] .- t["paper_dwp_ma30"]) .^ 2)
+    results["trajectory"] = Any[(; label="baseline", lwp=baseline.lwp, dwp_frozen=dwp_raw(baseline, frozen_base), contrib=contrib(base_terms))]
+    for spec in split(trajectory_runs, ",")
+        name, e = split(spec, ":"; limit=2) |> x -> (x[1], x[2])
+        # "sst_knot:9000:1e-3" style is parsed as name "sst_knot:9000", ε last
+        if count(==(':'), spec) == 2; parts = split(spec, ":"); name = parts[1] * ":" * parts[2]; e = parts[3]; end
+        ε = parse(Float64, e)
+        r = run_window(direction(name, ε); reference=baseline.snaps)
+        t, _ = evaluate(r, frozen_base, masks)
+        push!(timings, timing(r, "trajectory $spec"))
+        d = r.divergence
+        first_div = Dict(f => something(findfirst(x -> maximum(x[f]) > 0, d), 0) for f in String.(TRACKED))
+        push!(results["trajectory"], (; label=spec, ε, J_frozen=t["J_frozen"], J_moving=t["J_moving"], lwp_term=t["lwp_term"],
+              dwp_term=t["dwp_term_frozen"], lwp=r.lwp, dwp_frozen=dwp_raw(r, frozen_base), contrib=contrib(t),
+              divergence=d, first_divergent_record=first_div, switches=count(r.base .!= frozen_base)))
+        save()
+        growth = [maximum(x["ρqʳ"]) for x in d]
+        println("traj ", spec, " ΔJ_frozen=", t["J_frozen"] - base_terms["J_frozen"], " ΔJ_moving=", t["J_moving"] - base_terms["J_moving"],
+                " Δlwp_term=", t["lwp_term"] - base_terms["lwp_term"], " Δdwp_term=", t["dwp_term_frozen"] - base_terms["dwp_term_frozen"],
+                " first_divergent_record=", first_div, " max_level_rms_Δρqʳ@[1,10,30,60,91]=",
+                [growth[min(n, end)] for n in (1, 10, 30, 60, 91)], " max_level_rms_Δw@end=", maximum(d[end]["w"]),
+                " peak_level_Δρqʳ@end=", argmax(d[end]["ρqʳ"])); flush(stdout)
+    end
+    for t in timings; println("timing ", t); end
+    println("TRAJECTORY_DONE"); exit()
+end
 for name in directions, ε in epsilons
     rp = run_window(direction(name, ε)); rm = run_window(direction(name, -ε))
     push!(timings, timing(rp, "$name +$ε")); push!(timings, timing(rm, "$name -$ε"))

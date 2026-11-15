@@ -19,7 +19,8 @@ const TAPER_TOP = 2500.0
 const ENA_COORDINATE = (-28.0257, 39.0916)  # (longitude, latitude) of the ARM ENA site
 
 function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1,
-                   order=advection_order(), dx=nothing, solar_position=nothing, lookup_search=nothing)
+                   order=advection_order(), dx=nothing, solar_position=nothing, lookup_search=nothing,
+                   forcing_perturbation=identity)
     config = TOML.parsefile(joinpath(input, "interval.toml"))
     isnothing(nx) && (nx = config["nx"])
     isnothing(dx) && (dx = grid_spacing(get(config, "dx", 100.0)))
@@ -29,7 +30,8 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
     Oceananigans.defaults.FloatType = Float64
     faces = vec(readdlm(joinpath(input, "faces.csv"), ',', Float64))
     initial = readcsv(joinpath(input, "initial.csv"))
-    forcing_data = readcsv(joinpath(input, "forcing.csv"))
+    # forcing_perturbation(matrix) returns a modified copy (sensitivity experiments); identity otherwise.
+    forcing_data = forcing_perturbation(readcsv(joinpath(input, "forcing.csv")))
     z = initial[:, 1]; nz = length(z); times = unique(forcing_data[:, 1])
     grid = RectilinearGrid(architecture, Float64; size=(nx, nx, nz), x=(0, nx*dx), y=(0, nx*dx),
                           z=faces, halo=advection_halo(order), topology=(Periodic, Periodic, Bounded))

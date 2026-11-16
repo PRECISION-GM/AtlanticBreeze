@@ -20,7 +20,24 @@ prep = get(ENV, "ATLANTIC_RESTART", "prepare") == "prepare"
 fresh = get(ENV, "ATLANTIC_FRESH", "false") == "true"
 # ATLANTIC_EXTRA_STATE=true: checkpoint/restore the carried non-prognostic state found by restart_state_diff (17482):
 # anelastic pressure anomaly, microphysical surface_temperature, clock last_Δt/last_stage_Δt.
-extra = get(ENV, "ATLANTIC_EXTRA_STATE", "false") == "true"
+extra_mode = get(ENV, "ATLANTIC_EXTRA_STATE", "false"); extra = extra_mode != "false"; rad_all = extra_mode == "radiation_all"
+# ATLANTIC_EXTRA_STATE=radiation_all: also every array leaf anywhere under model.radiation (workspace incl.
+# atmospheric_state / lookup stencil), restored by path — tests whether the radiation solve depends on its own history.
+function array_leaves!(out, x, path, seen, depth)
+    depth > 12 && return out
+    if x isa AbstractArray{<:Number}
+        out[path] = x; return out
+    end
+    (isbitstype(typeof(x)) || x isa Union{Module, Function, DataType, String, Symbol} || x isa Oceananigans.Grids.AbstractGrid) && return out
+    id = objectid(x); id in seen && return out; push!(seen, id)
+    if x isa Union{Tuple, NamedTuple}
+        for (k, v) in pairs(x); array_leaves!(out, v, "$path[$k]", seen, depth + 1); end
+    else
+        for f in fieldnames(typeof(x)); isdefined(x, f) && array_leaves!(out, getfield(x, f), "$path.$f", seen, depth + 1); end
+    end
+    return out
+end
+radiation_arrays(m) = array_leaves!(Dict{String, Any}(), m.radiation, "radiation", Set{UInt}(), 0)
 radiation_field_names(m) = [n for n in propertynames(m.radiation) if getproperty(m.radiation, n) isa Oceananigans.Fields.AbstractField]
 function extra_snapshot(m)
     d = Dict{String, Any}("last_Δt" => m.clock.last_Δt, "last_stage_Δt" => m.clock.last_stage_Δt)
@@ -29,12 +46,18 @@ function extra_snapshot(m)
     # Radiation fluxes from the last scheduled update: stage 1 of the step that begins a block still uses them
     # (radiation_interface.jl: new fluxes enter from stage 2), and a fresh restore at iteration > 0 does not recompute them.
     for n in radiation_field_names(m); d["rad.$n"] = Array(parent(getproperty(m.radiation, n))); end
+    rad_all && for (k, a) in radiation_arrays(m); d["all.$k"] = Array(a); end
     return d
 end
 function extra_restore!(m, d)
     haskey(d, "p") && copyto!(parent(m.dynamics.pressure_anomaly), d["p"])
     haskey(d, "Ts") && copyto!(parent(m.microphysical_fields.surface_temperature), d["Ts"])
     for n in radiation_field_names(m); copyto!(parent(getproperty(m.radiation, n)), d["rad.$n"]); end
+    if rad_all
+        ra = radiation_arrays(m); nr = 0
+        for (k, a) in ra; haskey(d, "all.$k") && size(a) == size(d["all.$k"]) && (copyto!(a, d["all.$k"]); nr += 1); end
+        println("restored $nr radiation array leaves")
+    end
     m.clock.last_Δt = d["last_Δt"]; m.clock.last_stage_Δt = d["last_stage_Δt"]
 end
 case = make_case(input; nx, dx, architecture=GPU()); m = case.model; t0 = saved.time
@@ -62,4 +85,4 @@ for b in 1:nb
     worst = maximum(values(d))
     println("BLOCK $b worst_rel=$worst ", join(["$n=$(round(v; sigdigits=3))" for (n, v) in sort(collect(d); by=last, rev=true)[1:min(5, end)]], " "))
 end
-println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra radiation_fields=$(radiation_field_names(m))")
+println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra_mode radiation_fields=$(radiation_field_names(m))")

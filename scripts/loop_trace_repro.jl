@@ -89,6 +89,7 @@ for name in split(get(ENV, "ATLANTIC_VARIANTS", "one_step,loop_noop,loop2,loop2_
         with_large_stack(variants[name])
         println("VARIANT $name OK $(round(time() - t; digits=1))")
     catch err
+        showerror(stderr, err, catch_backtrace()); println(stderr); flush(stderr)   # full stack for the log
         msg = first(sprint(showerror, err isa TaskFailedException ? err.task.exception : err), 400)
         println("VARIANT $name FAIL $(round(time() - t; digits=1)) :: $msg")
     end

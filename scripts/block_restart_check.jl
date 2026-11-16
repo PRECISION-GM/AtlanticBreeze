@@ -21,15 +21,20 @@ fresh = get(ENV, "ATLANTIC_FRESH", "false") == "true"
 # ATLANTIC_EXTRA_STATE=true: checkpoint/restore the carried non-prognostic state found by restart_state_diff (17482):
 # anelastic pressure anomaly, microphysical surface_temperature, clock last_Δt/last_stage_Δt.
 extra = get(ENV, "ATLANTIC_EXTRA_STATE", "false") == "true"
+radiation_field_names(m) = [n for n in propertynames(m.radiation) if getproperty(m.radiation, n) isa Oceananigans.Fields.AbstractField]
 function extra_snapshot(m)
     d = Dict{String, Any}("last_Δt" => m.clock.last_Δt, "last_stage_Δt" => m.clock.last_stage_Δt)
     hasproperty(m.dynamics, :pressure_anomaly) && (d["p"] = Array(parent(m.dynamics.pressure_anomaly)))
     haskey(m.microphysical_fields, :surface_temperature) && (d["Ts"] = Array(parent(m.microphysical_fields.surface_temperature)))
+    # Radiation fluxes from the last scheduled update: stage 1 of the step that begins a block still uses them
+    # (radiation_interface.jl: new fluxes enter from stage 2), and a fresh restore at iteration > 0 does not recompute them.
+    for n in radiation_field_names(m); d["rad.$n"] = Array(parent(getproperty(m.radiation, n))); end
     return d
 end
 function extra_restore!(m, d)
     haskey(d, "p") && copyto!(parent(m.dynamics.pressure_anomaly), d["p"])
     haskey(d, "Ts") && copyto!(parent(m.microphysical_fields.surface_temperature), d["Ts"])
+    for n in radiation_field_names(m); copyto!(parent(getproperty(m.radiation, n)), d["rad.$n"]); end
     m.clock.last_Δt = d["last_Δt"]; m.clock.last_stage_Δt = d["last_stage_Δt"]
 end
 case = make_case(input; nx, dx, architecture=GPU()); m = case.model; t0 = saved.time
@@ -57,4 +62,4 @@ for b in 1:nb
     worst = maximum(values(d))
     println("BLOCK $b worst_rel=$worst ", join(["$n=$(round(v; sigdigits=3))" for (n, v) in sort(collect(d); by=last, rev=true)[1:min(5, end)]], " "))
 end
-println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra")
+println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra radiation_fields=$(radiation_field_names(m))")

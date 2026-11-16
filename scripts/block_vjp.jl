@@ -30,7 +30,12 @@ lookup_search = NumericalRadiation.FixedBinarySearch()
 function with_large_stack(f); task = Task(f, 512 * 1024^2); schedule(task); return fetch(task); end
 surface_temperature(m) = m.radiation.surface_radiation.surface_temperature
 cos_zenith_array(m) = m.radiation.solar_position.cos_zenith
-names_of(m) = Tuple(keys(prognostic_fields(m)))
+# Block state = prognostic fields + the radiation flux Fields of the last scheduled update (17526: a fresh-model
+# restart is exact only if those fluxes are written before update_state!, which builds stage-1 Gⁿ incl. radiative
+# heating from them). Gⁿ itself is derived inside block! by update_state!, so it needs no checkpoint or adjoint.
+radiation_field_names(m) = Tuple(n for n in propertynames(m.radiation) if getproperty(m.radiation, n) isa Oceananigans.Fields.AbstractField)
+state_fields(m) = merge(NamedTuple(prognostic_fields(m)), NamedTuple{radiation_field_names(m)}(Tuple(getproperty(m.radiation, n) for n in radiation_field_names(m))))
+names_of(m) = Tuple(keys(state_fields(m)))
 
 # Per-step SST/cos(zenith) from the native series (prescribed; controls here are the forcing input arrays).
 config = TOML.parsefile(joinpath(input, "interval.toml")); epoch = DateTime(config["epoch"]); t0 = saved.time
@@ -66,7 +71,7 @@ function block_seeded(m, inp, λ, Δt)
     block!(m, inp, Δt)
     s = sum(inp.gL) * lwp_of(m, inp)   # sum(gL), not gL[1]: no scalar getindex on traced arrays (17387)
     s += sum(view(interior(m.microphysical_fields.ρqʳ), :, size(interior(m.microphysical_fields.ρqʳ), 1) ÷ 2, :) .* inp.gD)   # DWP seed (restored: 8503336 commented it out)
-    for (n, f) in pairs(prognostic_fields(m)); s += sum(interior(f) .* λ[n]); end
+    for (n, f) in pairs(state_fields(m)); s += sum(interior(f) .* λ[n]); end   # adjoint of prognostics AND carried radiation fluxes
     return s
 end
 function block_vjp!(m, dm, inp, λ, Δt)
@@ -80,7 +85,7 @@ dz = diff(rcase.faces)
 on(a) = Reactant.to_rarray(a)
 inp = (; sst=on(sst_block(1)), cosz=on(cosz_block(1)), stepidx=on(collect(1.0:B)),
          lwp_weights=on(reshape(1000 .* dz ./ nx^2, 1, 1, :)), gL=on([1.0]), gD=on(fill(1.0, nx, nz)))   # nonzero DWP seed so the term is exercised
-λ = NamedTuple{names_of(m)}(Tuple(on(zero(Array(interior(f)))) for f in values(prognostic_fields(m))))
+λ = NamedTuple{names_of(m)}(Tuple(on(zero(Array(interior(f)))) for f in values(state_fields(m))))
 mlir_bytes() = sum(filesize(joinpath(output, "mlir", f)) for f in readdir(joinpath(output, "mlir")); init=0)
 # ATLANTIC_STRIP=true: strip_llvm_debuginfo (kernel debug info/locations, ~30% of the module text in 17374)
 strip = get(ENV, "ATLANTIC_STRIP", "false") == "true"

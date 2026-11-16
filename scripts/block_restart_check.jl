@@ -18,6 +18,20 @@ B = parse(Int, get(ENV, "ATLANTIC_BLOCK", "60")); nb = parse(Int, get(ENV, "ATLA
 prep = get(ENV, "ATLANTIC_RESTART", "prepare") == "prepare"
 # ATLANTIC_FRESH=true: every restart uses a NEWLY BUILT model (no cache/history from the continuous run)
 fresh = get(ENV, "ATLANTIC_FRESH", "false") == "true"
+# ATLANTIC_EXTRA_STATE=true: checkpoint/restore the carried non-prognostic state found by restart_state_diff (17482):
+# anelastic pressure anomaly, microphysical surface_temperature, clock last_Δt/last_stage_Δt.
+extra = get(ENV, "ATLANTIC_EXTRA_STATE", "false") == "true"
+function extra_snapshot(m)
+    d = Dict{String, Any}("last_Δt" => m.clock.last_Δt, "last_stage_Δt" => m.clock.last_stage_Δt)
+    hasproperty(m.dynamics, :pressure_anomaly) && (d["p"] = Array(parent(m.dynamics.pressure_anomaly)))
+    haskey(m.microphysical_fields, :surface_temperature) && (d["Ts"] = Array(parent(m.microphysical_fields.surface_temperature)))
+    return d
+end
+function extra_restore!(m, d)
+    haskey(d, "p") && copyto!(parent(m.dynamics.pressure_anomaly), d["p"])
+    haskey(d, "Ts") && copyto!(parent(m.microphysical_fields.surface_temperature), d["Ts"])
+    m.clock.last_Δt = d["last_Δt"]; m.clock.last_stage_Δt = d["last_stage_Δt"]
+end
 case = make_case(input; nx, dx, architecture=GPU()); m = case.model; t0 = saved.time
 surface_temperature(m) = m.radiation.surface_radiation.surface_temperature
 snapshot(m) = Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(m)))
@@ -30,15 +44,17 @@ step!(m) = (case.refresh!((; model=m)); time_step!(m, dt))   # host SST refresh 
 
 restore!(m, saved.fields, t0, 0)
 continuous = Dict{Int, Any}()
-for b in 1:nb; for _ in 1:B; step!(m); end; continuous[b] = snapshot(m); end
+extras = Dict{Int, Any}()
+for b in 1:nb; for _ in 1:B; step!(m); end; continuous[b] = snapshot(m); extras[b] = extra_snapshot(m); end
 state = saved.fields
 for b in 1:nb
     fresh && (global case = make_case(input; nx, dx, architecture=GPU()); global m = case.model)
     restore!(m, state, t0 + (b - 1) * B * dt, (b - 1) * B)
+    extra && b > 1 && extra_restore!(m, extras[b - 1])   # from the continuous run's block end (what a checkpoint would store)
     for _ in 1:B; step!(m); end
     global state = snapshot(m)
     d = Dict(n => maximum(abs.(state[n] .- continuous[b][n])) / max(maximum(abs.(continuous[b][n])), eps()) for n in keys(state))
     worst = maximum(values(d))
     println("BLOCK $b worst_rel=$worst ", join(["$n=$(round(v; sigdigits=3))" for (n, v) in sort(collect(d); by=last, rev=true)[1:min(5, end)]], " "))
 end
-println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh")
+println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra")

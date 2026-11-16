@@ -31,7 +31,7 @@ function leaves!(out, x, path, seen, depth)
         a = try Array(parent(x)) catch; try Array(x) catch; return out end end
         out[path] = a; return out
     elseif x isa Number
-        out[path] = [Float64(x)]; return out
+        out[path] = [x]; return out
     end
     (isbitstype(typeof(x)) && !(x isa Tuple)) && return out
     x isa Union{Module, Function, DataType, String, Symbol} && return out
@@ -57,9 +57,9 @@ function report(label, A, Bd)
         a, b = A[k], Bd[k]
         size(a) == size(b) || (println("$label SHAPE $k $(size(a)) $(size(b))"); continue)
         eltype(a) <: Number || continue
-        d = maximum(abs.(Float64.(a) .- Float64.(b)); init=0.0)
+        d = maximum(abs.(a .- b); init=0.0)   # abs handles complex solver buffers (17482)
         if !(d == 0 || (isnan(d) && all(isnan.(a) .== isnan.(b))))
-            n += 1; s = maximum(abs.(Float64.(a)); init=0.0)
+            n += 1; s = maximum(abs.(a); init=0.0)
             println("$label DIFF $k max_abs=$d max_ref=$s size=$(size(a))")
         end
     end

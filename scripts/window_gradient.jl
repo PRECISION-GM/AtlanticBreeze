@@ -188,8 +188,9 @@ function window_objective(m, x, inp, Δt, loop)
             @trace mincut=true checkpointing=true track_numbers=false for ic in 1:c
                 @trace mincut=true checkpointing=true track_numbers=false for ie in 1:e
                     s = (mi - 1) * 60 + (ic - 1) * e + ie
-                    parent(surface_temperature(m)) .= sst[s]
-                    cos_zenith_array(m) .= inp.cosz[s]
+                    # length-1 slices, not scalar reads: GPU arrays natively, dynamic slices when traced
+                    parent(surface_temperature(m)) .= reshape(sst[s:s], 1, 1, 1)
+                    cos_zenith_array(m) .= reshape(inp.cosz[s:s], 1, 1)
                     time_step!(m, Δt)
                 end
             end

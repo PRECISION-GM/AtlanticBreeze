@@ -70,8 +70,22 @@ Wsst_full = reduce(vcat, permutedims.(interp_weights.(Ref(ftimes), step_times)))
 active_knots = findall(vec(any(Wsst_full .!= 0; dims=1)))
 Wsst = Wsst_full[:, active_knots]                       # nsteps × K
 cosz = [max(Breeze.AtmosphereModels.cos_solar_zenith_angle(Breeze.AtmosphereModels.compute_datetime(t, epoch), ENA_COORDINATE...), 0.0) for t in step_times]
-nx_controls = 2 + length(active_knots)
-note("controls"; basis="[heating K/day, moistening g/kg/day, SST K at knots $(ftimes[active_knots]) s]")
+# ATLANTIC_CONTROLS = reduced (default: 2 tapered amplitudes + SST knots) | inputs (native forcing input arrays).
+# inputs: x = vcat(vec(δ_f) for f in ATLANTIC_INPUT_FIELDS), δ_f[k, j] the additive change of the forcing.csv
+# value of field f at model level k and forcing knot ftimes[active_knots[j]], in that file's native units.
+# SST is NOT a control in inputs mode: prescribed SST (unperturbed knots) as in the matched forward run.
+const CONTROLS = get(ENV, "ATLANTIC_CONTROLS", "reduced")
+const INPUT_UNITS = Dict("T" => "K s-1", "q" => "kg kg-1 s-1", "w" => "m s-1", "ug" => "m s-1", "vg" => "m s-1")
+const INPUT_COLUMN = Dict("T" => "dT_Ks", "q" => "dq_kgkgs", "w" => "w_ms", "ug" => "ug_ms", "vg" => "vg_ms")
+input_fields = CONTROLS == "inputs" ? String.(split(get(ENV, "ATLANTIC_INPUT_FIELDS", "T,q"), ",")) : String[]
+all(f -> haskey(INPUT_UNITS, f), input_fields) || error("ATLANTIC_INPUT_FIELDS must be among $(keys(INPUT_UNITS))")
+nk = length(active_knots)
+nzc = size(readcsv(joinpath(input, "initial.csv")), 1)
+nx_controls = CONTROLS == "inputs" ? length(input_fields) * nzc * nk : 2 + nk
+block(x, i) = x[(i - 1) * nzc * nk + 1:i * nzc * nk]
+note("controls"; mode=CONTROLS, basis=CONTROLS == "inputs" ?
+     "native input arrays $(input_fields) at $nzc levels × knots $(ftimes[active_knots]) s, SST prescribed" :
+     "[heating K/day, moistening g/kg/day, SST K at knots $(ftimes[active_knots]) s]", nx_controls)
 
 # Fixed observation operators.
 paper_lwp = readcsv(joinpath(targets, "paper_fig2_physical_digitized.csv"))
@@ -108,6 +122,45 @@ energy_correction(m) = getfield(getfield(m.forcing.ρE, 1)[end], 1).tls
 moisture_correction(m) = getfield(getfield(m.forcing.ρqᵛ, 1)[end], 1).qls
 surface_temperature(m) = m.radiation.surface_radiation.surface_temperature
 cos_zenith_array(m) = m.radiation.solar_position.cos_zenith
+# The model's own references to the native input series (same pattern as energy_correction): order in model.jl
+# :E => (thermo.E, correction.E); :qᵛ => (thermo.qᵛ, subsidence, correction.qᵛ); :u => (geostrophic.u, …); :v => (geostrophic.v, …).
+# TimeVaryingGeostrophicForcing for u holds vᵍ and for v holds uᵍ. The subsidence velocity series is one object
+# shared by every advected field. Identity with native.input_series is asserted below.
+forcing_term(m, name, i) = getfield(getfield(getproperty(m.forcing, name), 1)[i], 1)
+input_series_of(m) = (; T=forcing_term(m, :ρE, 1).tls, q=forcing_term(m, :ρqᵛ, 1).qls, w=forcing_term(m, :ρqᵛ, 2).velocity,
+                       ug=forcing_term(m, :ρv, 1).geostrophic_velocity, vg=forcing_term(m, :ρu, 1).geostrophic_velocity)
+let own = input_series_of(model)
+    for f in (:T, :q, :w, :ug, :vg)
+        parent(getproperty(own, f).data) === parent(getproperty(native.input_series, f).data) ||
+            error("model forcing $f does not alias make_case input_series.$f")
+    end
+    note("input series alias check passed"; fields=(:T, :q, :w, :ug, :vg))
+end
+
+# Input-array embedding: parent(fts.data) is (1, 1, Nz + 2H, Nt); E places the nz interior levels, S the active knots.
+series_parent(s) = parent(s.data)
+base_parent = Dict(f => Array(series_parent(getproperty(native.input_series, Symbol(f)))) for f in input_fields)
+for f in input_fields
+    sz = size(base_parent[f]); (sz[1], sz[2], sz[4]) == (1, 1, length(ftimes)) && (sz[3] - nz) % 2 == 0 ||
+        error("unexpected FieldTimeSeries parent size $sz for $f")
+end
+function control_inputs(arch)
+    on(a) = arch isa ReactantState ? Reactant.to_rarray(a) : on_architecture(arch, a)
+    isempty(input_fields) && return (; base=(), E=on(zeros(1, 1)), S=on(zeros(1, 1)))
+    Nzp = size(first(values(base_parent)), 3); off = (Nzp - nz) ÷ 2
+    E = zeros(Nzp, nz); for k in 1:nz; E[off + k, k] = 1; end
+    S = zeros(nk, length(ftimes)); for (j, a) in enumerate(active_knots); S[j, a] = 1; end
+    return (; base=Tuple(on(base_parent[f]) for f in input_fields), E=on(E), S=on(S))
+end
+# Exact embedding (0/1 matrices): with δ = 0 the arrays are the unperturbed forcing.csv values.
+function set_inputs!(m, series, x, ci)
+    for (i, f) in enumerate(input_fields)
+        δ = reshape(block(x, i), nz, nk)
+        P = ci.E * δ * ci.S
+        series_parent(getproperty(series, Symbol(f))) .= ci.base[i] .+ reshape(P, 1, 1, size(P, 1), size(P, 2))
+    end
+    return nothing
+end
 
 # Native diagnostic baseline: frozen cloud base and masks (host loop, same per-step updates as the objective).
 function restore!(m, fields, time)
@@ -117,9 +170,11 @@ function restore!(m, fields, time)
 end
 function native_diagnostic(x)
     restore!(model, Dict(n => on_architecture(GPU(), a) for (n, a) in saved.fields), t0)
-    parent(energy_correction(model).data) .= on_architecture(GPU(), reshape(vcat(zeros(hz), native.taper .* x[1] ./ 86400, zeros(hz)), 1, 1, :, 1))
-    parent(moisture_correction(model).data) .= on_architecture(GPU(), reshape(vcat(zeros(hz), native.taper .* x[2] ./ (1000 * 86400), zeros(hz)), 1, 1, :, 1))
-    sst = Wsst * (sst_knots[active_knots] .+ x[3:end])
+    xr = CONTROLS == "inputs" ? zeros(2) : x
+    parent(energy_correction(model).data) .= on_architecture(GPU(), reshape(vcat(zeros(hz), native.taper .* xr[1] ./ 86400, zeros(hz)), 1, 1, :, 1))
+    parent(moisture_correction(model).data) .= on_architecture(GPU(), reshape(vcat(zeros(hz), native.taper .* xr[2] ./ (1000 * 86400), zeros(hz)), 1, 1, :, 1))
+    sst = CONTROLS == "inputs" ? Wsst * sst_knots[active_knots] : Wsst * (sst_knots[active_knots] .+ x[3:end])
+    CONTROLS == "inputs" && set_inputs!(model, native.input_series, on_architecture(GPU(), x), control_inputs(GPU()))
     prepare_first_time_step!(model, dt)
     lwp = Float64[]; base = Matrix{Int}(undef, nx, 0); rain = Array{Float64}(undef, nx, nz, 0)
     rec() = begin
@@ -169,16 +224,23 @@ function window_inputs(arch)
               Wsst=on(Wsst), sst_knots=on(sst_knots[active_knots]), cosz=on(cosz),
               lwp_weights=on(lwp_weights), dwp_weights=on(dwp_weights), ML=on(ML), MD=on(MD),
               obs_L=on(obs_L[L_mask]), obs_D=on(obs_D[D_mask]), onehot=on(Matrix{Float64}(I(nrec))),
-              recidx=on(collect(1.0:nrec)), stepidx=on(collect(1.0:length(cosz))))
+              recidx=on(collect(1.0:nrec)), stepidx=on(collect(1.0:length(cosz))),
+              ci=control_inputs(arch), wLD=on([1.0, 1.0]))   # J = wL·J_LWP + wD·J_DWP (component gradients by reseeding)
 end
 # ATLANTIC_CKPT: nested (mincut+checkpointing on all four loops) | nomincut | none — trace bisection (17115)
 const CKPT = get(ENV, "ATLANTIC_CKPT", "nested")
 const MC = CKPT == "nested"; const CP = CKPT != "none"
-@eval function window_objective(m, x, inp, Δt, loop)
+@eval function window_terms(m, x, inp, Δt, loop)
     for (name, f) in pairs(prognostic_fields(m)); interior(f) .= inp.fields[String(name)]; end
-    parent(energy_correction(m).data) .= inp.energy_taper .* reshape(x[1:1], 1, 1, 1, 1)
-    parent(moisture_correction(m).data) .= inp.moisture_taper .* reshape(x[2:2], 1, 1, 1, 1)
-    sst = inp.Wsst * (inp.sst_knots .+ x[3:end])
+    if $(CONTROLS == "inputs")
+        parent(energy_correction(m).data) .= 0; parent(moisture_correction(m).data) .= 0
+        set_inputs!(m, input_series_of(m), x, inp.ci)
+        sst = inp.Wsst * inp.sst_knots
+    else
+        parent(energy_correction(m).data) .= inp.energy_taper .* reshape(x[1:1], 1, 1, 1, 1)
+        parent(moisture_correction(m).data) .= inp.moisture_taper .* reshape(x[2:2], 1, 1, 1, 1)
+        sst = inp.Wsst * (inp.sst_knots .+ x[3:end])
+    end
     reset!(m.clock); m.clock.time = inp.time
     initialize!(m); update_state!(m); prepare_first_time_step!(m, Δt)
     w = m.microphysical_fields
@@ -208,7 +270,11 @@ const MC = CKPT == "nested"; const CP = CKPT != "none"
         end
     end
     rL = (inp.ML * lwp .- inp.obs_L) ./ 100; rD = inp.MD * dwp .- inp.obs_D
-    return sum(rL .^ 2) / length(rL) + sum(rD .^ 2) / length(rD)
+    return sum(rL .^ 2) / length(rL), sum(rD .^ 2) / length(rD)
+end
+function window_objective(m, x, inp, Δt, loop)
+    JL, JD = window_terms(m, x, inp, Δt, loop)
+    return sum(inp.wLD .* [1.0, 0.0]) * JL + sum(inp.wLD .* [0.0, 1.0]) * JD
 end
 # NOTE: the per-cell transect view uses the centre row like observation_sensitivity.jl (j = nx÷2).
 
@@ -220,15 +286,47 @@ note("native objective"; J0, J0_repeat=J0r, J_diag, J_moving_baseline=J_moving, 
 results = Dict{String, Any}("scope" => "frozen-mask conditional derivative of the 13:30-15:00 UTC MA30 LWP+DWP objective, fixed native-spinup IC (spinup dependence excluded); experimental Breeze ratio+stable",
     "dynamics" => string(native.dynamics), "nx" => nx, "dx" => dx, "nz" => nz, "dt" => dt, "steps" => nsteps, "loop" => loop,
     "radiation_updates" => count(n -> n % native.radiation_iterations == 0, 0:nsteps-1),
-    "controls" => "heating K/day, moistening g/kg/day (tapered, time-constant), SST K at knots", "sst_knot_times" => ftimes[active_knots],
+    "controls" => CONTROLS == "inputs" ? "native forcing input arrays $(join(input_fields, ",")) (level × knot, native units), SST prescribed" :
+                  "heating K/day, moistening g/kg/day (tapered, time-constant), SST K at knots", "sst_knot_times" => ftimes[active_knots],
+    "control_mode" => CONTROLS, "input_fields" => input_fields, "active_knot_times_s" => ftimes[active_knots],
     "J_native" => J0, "J_native_repeat" => J0r, "J_diagnostic_loop" => J_diag, "nL" => count(L_mask), "nD" => count(D_mask),
     "native_first_s" => t_native, "native_warm_s" => t_native_warm, "build_native_s" => build_native,
     "gpu" => gpu_memory(), "commit" => get(ENV, "ATLANTIC_COMMIT", "unknown"), "breeze" => pkgdir(Breeze))
 save() = open(io -> TOML.print(io, results), joinpath(output, "window_gradient.toml"), "w"); save()
 
-# Native central differences of the same objective.
+# Input mode: matched directional central differences of J_LWP, J_DWP and J (native), per field.
+# Direction v_f: scale_f × smooth profile (1 at the surface, 0 above 3 km) at every active knot, plus a
+# knot-contrast direction (+, −, + … across knots) to test the time structure. ε multiplies the direction.
+const INPUT_SCALE = Dict("T" => 1 / 86400, "q" => 1e-3 / 86400, "w" => 1e-3, "ug" => 0.1, "vg" => 0.1)  # 1 K/day, 1 g/kg/day, 1 mm/s, 0.1 m/s
+zc = native.z
+function input_direction(f, kind)
+    v = zeros(nx_controls); i = findfirst(==(f), input_fields)
+    prof = INPUT_SCALE[f] .* clamp.(1 .- zc ./ 3000, 0, 1)
+    tw = kind == "uniform" ? ones(nk) : [(-1.0)^(j - 1) for j in 1:nk]
+    v[(i - 1) * nzc * nk + 1:i * nzc * nk] .= vec(prof * tw')
+    return v
+end
+Jt(x) = window_terms(model, on_architecture(GPU(), x), inputs, dt, loop)
+input_fd = []
+if CONTROLS == "inputs"
+    JL0, JD0 = Jt(x0); results["J_LWP_native"] = JL0; results["J_DWP_native"] = JD0; save()
+    note("native components"; JL0, JD0, sum=JL0 + JD0, J0)
+    for spec in filter(!isempty, split(get(ENV, "ATLANTIC_INPUT_DIRECTIONS", "T:uniform,q:uniform"), ","))
+        f, kind = split(spec, ":"); v = input_direction(f, kind)
+        for ε in parse.(Float64, split(get(ENV, "ATLANTIC_INPUT_EPSILONS", "1,0.3"), ","))
+            Lp, Dp = Jt(x0 .+ ε .* v); Lm, Dm = Jt(x0 .- ε .* v)
+            r = Dict("field" => String(f), "direction" => String(kind), "epsilon" => ε, "scale" => INPUT_SCALE[f], "units" => INPUT_UNITS[f],
+                     "dLWP" => (Lp - Lm) / 2ε, "dDWP" => (Dp - Dm) / 2ε, "dJ" => (Lp + Dp - Lm - Dm) / 2ε,
+                     "J_plus" => Lp + Dp, "J_minus" => Lm + Dm)
+            push!(input_fd, r); note("input FD"; (Symbol(k) => v for (k, v) in r)...)
+            results["input_fd"] = input_fd; save()
+        end
+    end
+end
+
+# Native central differences of the same objective (reduced mode).
 fd = []
-for spec in filter(!isempty, split(get(ENV, "ATLANTIC_FD_DIRECTIONS", "1:0.01,1:0.003,3:0.01"), ","))
+for spec in filter(!isempty, split(get(ENV, "ATLANTIC_FD_DIRECTIONS", CONTROLS == "inputs" ? "" : "1:0.01,1:0.003,3:0.01"), ","))
     k, ε = parse(Int, split(spec, ":")[1]), parse(Float64, split(spec, ":")[2])
     e = zeros(nx_controls); e[k] = ε
     Jp = J(x0 .+ e); Jm = J(x0 .- e)
@@ -269,10 +367,32 @@ gc = @elapsed cgrad = with_large_stack(() -> Reactant.@compile compile_options=o
 results["reverse_compile_s"] = gc; save()
 g1 = @elapsed begin (Jg, g) = cgrad(rmodel, dmodel, x, gx, rinputs, dt, loop); g = Array(g); Jg = Float64(Jg) end
 g2 = @elapsed begin (Jg2, gg) = cgrad(rmodel, dmodel, x, gx, rinputs, dt, loop); gg = Array(gg) end
-results["gradient"] = g; results["gradient_repeat_identical"] = g == gg; results["J_gradient_primal"] = Jg
+results["gradient_repeat_identical"] = g == gg; results["J_gradient_primal"] = Jg
+CONTROLS == "inputs" || (results["gradient"] = g)
+if CONTROLS == "inputs"   # component gradients by reseeding the same compiled reverse program
+    comp(w) = (ri = merge(rinputs, (; wLD=Reactant.to_rarray(w))); Array(cgrad(rmodel, dmodel, x, gx, ri, dt, loop)[2]))
+    gL = comp([1.0, 0.0]); gD = comp([0.0, 1.0])
+    results["component_sum_rel"] = maximum(abs.(gL .+ gD .- g)) / max(maximum(abs.(g)), eps())
+    results["input_fd_vs_ad"] = [merge(r, Dict("ad_dLWP" => sum(gL .* input_direction(r["field"], r["direction"])),
+                                                "ad_dDWP" => sum(gD .* input_direction(r["field"], r["direction"])),
+                                                "ad_dJ" => sum(g .* input_direction(r["field"], r["direction"])))) for r in input_fd]
+    NCDatasets.NCDataset(joinpath(output, "input_gradient.nc"), "c") do ds
+        ds.attrib["scope"] = results["scope"]; ds.attrib["objective"] = "J = J_LWP + J_DWP, J_LWP = mean(((MA30 LWP - paper)/100 g m-2)^2), J_DWP = mean(((MA30 DWP - paper)/1 g m-2)^2), frozen masks, nL=$(count(L_mask)) nD=$(count(D_mask)), 13:30-15:00 UTC"
+        ds.attrib["dynamics"] = string(native.dynamics); ds.attrib["commit"] = get(ENV, "ATLANTIC_COMMIT", "unknown")
+        ds.attrib["sst"] = "prescribed (not a control)"; ds.attrib["ic"] = "fixed native-spinup window IC; spinup dependence excluded"
+        NCDatasets.defDim(ds, "z", nz); NCDatasets.defDim(ds, "knot", nk)
+        NCDatasets.defVar(ds, "z", zc, ("z",); attrib=Dict("units" => "m", "long_name" => "model level centre height"))
+        NCDatasets.defVar(ds, "knot_time", Float64.(ftimes[active_knots]), ("knot",); attrib=Dict("units" => "s since $(epoch)", "utc_hour" => string(utc.(ftimes[active_knots]))))
+        for (i, f) in enumerate(input_fields), (name, gv) in (("dJ", g), ("dJ_LWP", gL), ("dJ_DWP", gD))
+            NCDatasets.defVar(ds, "$(name)_d$(f)", reshape(block(gv, i), nz, nk), ("z", "knot");
+                attrib=Dict("units" => "1 per ($(INPUT_UNITS[f]))", "input_column" => INPUT_COLUMN[f],
+                            "meaning" => "derivative of $name w.r.t. the forcing.csv value of $f at (level, knot); linear time interpolation between knots"))
+        end
+    end
+end
 results["reverse_first_exec_synchronized_s"] = g1; results["reverse_warm_exec_synchronized_s"] = g2
 results["gradient_finite_nonzero"] = all(isfinite, g) && any(!iszero, g)
-results["fd_vs_ad"] = [Dict("control" => k, "epsilon" => ε, "fd" => s, "ad" => g[k], "rel" => abs(g[k] - s) / max(abs(s), abs(g[k]), eps())) for (k, ε, s) in fd]
+results["fd_vs_ad"] = CONTROLS == "inputs" ? [] : [Dict("control" => k, "epsilon" => ε, "fd" => s, "ad" => g[k], "rel" => abs(g[k] - s) / max(abs(s), abs(g[k]), eps())) for (k, ε, s) in fd]
 results["max_rss_GB"] = Sys.maxrss() / 1e9; results["gpu_end"] = gpu_memory(); save()
 note("reverse gradient"; g, Jg, gc, g1, g2)
 println("WINDOW_GRADIENT_DONE finite_nonzero=", results["gradient_finite_nonzero"], " parity=", results["primal_parity"], " fd_vs_ad=", results["fd_vs_ad"])

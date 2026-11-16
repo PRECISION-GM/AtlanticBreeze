@@ -46,7 +46,10 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
     microphysics = P3Microphysics(; cloud=L.CloudDroplets(; number_concentration=75e6), aerosol)
     columns(c) = [forcing_data[forcing_data[:,1].==t,c] for t in times]
     series(c) = L.profile_time_series(grid,times,columns(c))
-    thermo = L.large_scale_thermodynamic_forcings(series(3), series(4); microphysics, thermodynamic_constants=constants,
+    # Native forcing input arrays (height × hourly knot), kept by reference so input-gradient scripts can
+    # write perturbations into the same FieldTimeSeries the forcing operators read (window_gradient.jl inputs mode).
+    input_series = (; T=series(3), q=series(4), w=series(5), ug=series(6), vg=series(7))
+    thermo = L.large_scale_thermodynamic_forcings(input_series.T, input_series.q; microphysics, thermodynamic_constants=constants,
         moisture_name=:qᵛ, moisture_basis=:mass_fraction)
     # Controls: added dT/dt [K/day] and dq/dt [g/kg/day], tapered out by 2500 m. They are a separate,
     # linear, time-constant forcing whose profiles the model owns, so a differentiated program can set
@@ -57,8 +60,8 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         L.profile_time_series(grid,knots,fill(controls[1].*taper./86400,2)),
         L.profile_time_series(grid,knots,fill(controls[2].*taper./(1000*86400),2));
         microphysics, thermodynamic_constants=constants, moisture_name=:qᵛ, moisture_basis=:mass_fraction)
-    geostrophic = L.time_varying_geostrophic_forcings(series(6),series(7))
-    subsidence = L.LargeScaleVerticalAdvection(series(5))
+    geostrophic = L.time_varying_geostrophic_forcings(input_series.ug,input_series.vg)
+    subsidence = L.LargeScaleVerticalAdvection(input_series.w)
     sponge = L.SAMSponge(; damping_depth_fraction=0.2)
     forcing = Dict{Symbol,Tuple}(:u=>(geostrophic.u,subsidence,sponge),
         :v=>(geostrophic.v,subsidence,sponge), :w=>(sponge,), :E=>(thermo.E,correction.E), :θ=>(subsidence,))
@@ -116,7 +119,7 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         set!(surface_temperature,L.interpolate_profile(times,sst_values,sim.model.clock.time))
         fill_halo_regions!(surface_temperature)
     end
-    return (;model,config,z,faces,pressure,density,refresh!,taper,order,dx,radiation_iterations,dynamics)
+    return (;model,config,z,faces,pressure,density,refresh!,taper,order,dx,radiation_iterations,dynamics,input_series,forcing_times=times)
 end
 
 # Domain-mean profiles (theta, qv, cloud and total liquid, cloud fraction, w variance), the LWP map and

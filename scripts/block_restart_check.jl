@@ -68,9 +68,16 @@ end
 case = make_case(input; nx, dx, architecture=GPU()); m = case.model; t0 = saved.time
 surface_temperature(m) = m.radiation.surface_radiation.surface_temperature
 snapshot(m) = Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(m)))
-function restore!(m, fields, time, iteration)
+# ATLANTIC_RAD_FIRST=true: write the radiation flux Fields of the previous block end BEFORE initialize!/update_state!,
+# so stage-1 tendencies Gⁿ (incl. radiative heating of ρθ) are built from the carried fluxes (17512: timestepper restore
+# fixes the drift; only Gⁿ[ρθ] differed after restore in 17485).
+rad_first = get(ENV, "ATLANTIC_RAD_FIRST", "false") == "true"
+function restore!(m, fields, time, iteration; radiation=nothing)
     for (name, f) in pairs(prognostic_fields(m)); interior(f) .= on_architecture(GPU(), fields[String(name)]); end
     reset!(m.clock); m.clock.time = time; m.clock.iteration = iteration
+    if !isnothing(radiation)
+        for (n, a) in radiation; copyto!(parent(getproperty(m.radiation, n)), a); end
+    end
     initialize!(m); update_state!(m); prep && prepare_first_time_step!(m, dt)
 end
 step!(m) = (case.refresh!((; model=m)); time_step!(m, dt))   # host SST refresh as the native forward
@@ -82,7 +89,8 @@ for b in 1:nb; for _ in 1:B; step!(m); end; continuous[b] = snapshot(m); extras[
 state = saved.fields
 for b in 1:nb
     fresh && (global case = make_case(input; nx, dx, architecture=GPU()); global m = case.model)
-    restore!(m, state, t0 + (b - 1) * B * dt, (b - 1) * B)
+    rad = rad_first && b > 1 ? Dict(n => extras[b - 1]["rad.$n"] for n in radiation_field_names(m)) : nothing
+    restore!(m, state, t0 + (b - 1) * B * dt, (b - 1) * B; radiation=rad)
     extra && b > 1 && extra_restore!(m, extras[b - 1])   # from the continuous run's block end (what a checkpoint would store)
     for _ in 1:B; step!(m); end
     global state = snapshot(m)
@@ -90,4 +98,4 @@ for b in 1:nb
     worst = maximum(values(d))
     println("BLOCK $b worst_rel=$worst ", join(["$n=$(round(v; sigdigits=3))" for (n, v) in sort(collect(d); by=last, rev=true)[1:min(5, end)]], " "))
 end
-println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra_mode radiation_fields=$(radiation_field_names(m))")
+println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra_mode rad_first=$rad_first radiation_fields=$(radiation_field_names(m))")

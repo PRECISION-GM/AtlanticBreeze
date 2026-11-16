@@ -23,6 +23,10 @@ build = @elapsed case = with_large_stack(() -> CUDA.@allowscalar make_case(input
     solar_position=FixedCosineZenith(Reactant.to_rarray(fill(0.5, nx, nx))), lookup_search))
 m = case.model; note("built"; build, nx, dynamics=case.dynamics)
 dt = 1.0
+# window_gradient.jl accessors (17291/17292: without these, `surface_temperature` resolved to another binding → "Nothing not callable")
+surface_temperature(m) = m.radiation.surface_radiation.surface_temperature
+cos_zenith_array(m) = m.radiation.solar_position.cos_zenith
+w8 = Reactant.to_rarray(rand(nx, nx, size(interior(m.microphysical_fields.ρqʳ), 3)))
 sst = Reactant.to_rarray(fill(290.0, 4)); idx = Reactant.to_rarray(collect(1.0:4))
 
 one_step(m, dt) = (time_step!(m, dt); nothing)
@@ -43,7 +47,35 @@ function loop_noop(m, dt, sst, idx)   # loop machinery only, no model step
     return nothing
 end
 
-variants = Dict("one_step" => () -> Reactant.@code_hlo(compile_options=opts, one_step(m, dt)),
+function loop2_forcing(m, dt, sst, idx)   # SST + cos(zenith) writes, as window_objective
+    @trace track_numbers=false for i in 1:2
+        sel = ifelse.(idx .== i, 1.0, 0.0)
+        parent(surface_temperature(m)) .= sum(sst .* sel)
+        cos_zenith_array(m) .= sum(sst .* sel) ./ 600
+        time_step!(m, dt)
+    end
+    return nothing
+end
+function loop2_record(m, dt, idx, w8)    # accumulate a field reduction into a carried vector
+    acc = idx .* 0
+    @trace track_numbers=false for i in 1:2
+        time_step!(m, dt)
+        acc = acc .+ sum(interior(m.microphysical_fields.ρqʳ) .* w8) .* ifelse.(idx .== i, 1.0, 0.0)
+    end
+    return sum(acc)
+end
+function nested_ckpt(m, dt)              # two nested checkpointed loops, as window_objective
+    @trace mincut=true checkpointing=true track_numbers=false for i in 1:2
+        @trace mincut=true checkpointing=true track_numbers=false for j in 1:1
+            time_step!(m, dt)
+        end
+    end
+    return nothing
+end
+variants = Dict("loop2_forcing" => () -> Reactant.@code_hlo(compile_options=opts, loop2_forcing(m, dt, sst, idx)),
+                "loop2_record" => () -> Reactant.@code_hlo(compile_options=opts, loop2_record(m, dt, idx, w8)),
+                "nested_ckpt" => () -> Reactant.@code_hlo(compile_options=opts, nested_ckpt(m, dt)),
+                "one_step" => () -> Reactant.@code_hlo(compile_options=opts, one_step(m, dt)),
                 "loop_noop" => () -> Reactant.@code_hlo(compile_options=opts, loop_noop(m, dt, sst, idx)),
                 "loop2" => () -> Reactant.@code_hlo(compile_options=opts, loop2(m, dt)),
                 "loop2_ckpt" => () -> Reactant.@code_hlo(compile_options=opts, loop2_ckpt(m, dt)),

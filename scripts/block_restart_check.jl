@@ -85,11 +85,19 @@ snapshot(m) = Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognosti
 # so stage-1 tendencies Gⁿ (incl. radiative heating of ρθ) are built from the carried fluxes (17512: timestepper restore
 # fixes the drift; only Gⁿ[ρθ] differed after restore in 17485).
 rad_first = get(ENV, "ATLANTIC_RAD_FIRST", "false") == "true"
-function restore!(m, fields, time, iteration; radiation=nothing)
+# ATLANTIC_PRE_RE=<regex>: also write matching storage arrays (from the continuous block end) BEFORE
+# initialize!/update_state!, so derived Gⁿ is rebuilt from them (split: time-averaged velocity caches, 17543).
+pre_re = haskey(ENV, "ATLANTIC_PRE_RE") ? Regex(ENV["ATLANTIC_PRE_RE"]) : nothing
+all_arrays(m) = array_leaves!(Dict{String, Any}(), m, "model", Set{UInt}(), 0)
+function restore!(m, fields, time, iteration; radiation=nothing, pre=nothing)
     for (name, f) in pairs(prognostic_fields(m)); interior(f) .= on_architecture(GPU(), fields[String(name)]); end
     reset!(m.clock); m.clock.time = time; m.clock.iteration = iteration
     if !isnothing(radiation)
         for (n, a) in radiation; copyto!(parent(getproperty(m.radiation, n)), a); end
+    end
+    if !isnothing(pre) && !isnothing(pre_re)
+        np = 0; for (k, a) in all_arrays(m); occursin(pre_re, k) && haskey(pre, k) && size(a) == size(pre[k]) && (copyto!(a, pre[k]); np += 1); end
+        println("pre-restored $np arrays matching $(pre_re.pattern)")
     end
     initialize!(m); update_state!(m); prep && prepare_first_time_step!(m, dt)
 end
@@ -97,13 +105,13 @@ step!(m) = (case.refresh!((; model=m)); time_step!(m, dt))   # host SST refresh 
 
 restore!(m, saved.fields, t0, 0)
 continuous = Dict{Int, Any}()
-extras = Dict{Int, Any}()
-for b in 1:nb; for _ in 1:B; step!(m); end; continuous[b] = snapshot(m); extras[b] = extra_snapshot(m); end
+extras = Dict{Int, Any}(); pre_snaps = Dict{Int, Any}()
+for b in 1:nb; for _ in 1:B; step!(m); end; continuous[b] = snapshot(m); extras[b] = extra_snapshot(m); isnothing(pre_re) || (pre_snaps[b] = Dict(k => Array(a) for (k, a) in all_arrays(m) if occursin(pre_re, k))); end
 state = saved.fields
 for b in 1:nb
     fresh && (global case = build_case(); global m = case.model)
     rad = rad_first && b > 1 ? Dict(n => extras[b - 1]["rad.$n"] for n in radiation_field_names(m)) : nothing
-    restore!(m, state, t0 + (b - 1) * B * dt, (b - 1) * B; radiation=rad)
+    restore!(m, state, t0 + (b - 1) * B * dt, (b - 1) * B; radiation=rad, pre=(b > 1 && !isnothing(pre_re)) ? pre_snaps[b - 1] : nothing)
     extra && b > 1 && extra_restore!(m, extras[b - 1])   # from the continuous run's block end (what a checkpoint would store)
     for _ in 1:B; step!(m); end
     global state = snapshot(m)

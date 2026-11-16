@@ -25,7 +25,7 @@ extra_mode = get(ENV, "ATLANTIC_EXTRA_STATE", "false"); extra = extra_mode != "f
 # atmospheric_state / lookup stencil), restored by path — tests whether the radiation solve depends on its own history.
 function array_leaves!(out, x, path, seen, depth)
     depth > 12 && return out
-    if x isa AbstractArray{<:Number}
+    if x isa Union{Array{<:Number}, CUDA.CuArray{<:Number}}   # storage only; wrappers (OffsetArray, Field) are walked into
         out[path] = x; return out
     end
     (isbitstype(typeof(x)) || x isa Union{Module, Function, DataType, String, Symbol} || x isa Oceananigans.Grids.AbstractGrid) && return out

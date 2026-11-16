@@ -109,7 +109,7 @@ function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aer
         Rd=Breeze.Thermodynamics.dry_air_gas_constant(constants); Rv=Breeze.Thermodynamics.vapor_gas_constant(constants)
         p_ref=col(Array(interior(model.dynamics.reference_state.pressure,1,1,:)))
         ρ₀=p_ref./((Rd.*(1 .-qᵛ₀).+Rv.*qᵛ₀).*T₀)
-        set!(model; ρ=ρ₀, T=T₀, qᵛ=qᵛ₀, u=repeat(col(state.u),nx,nx,1), v=repeat(col(state.v),nx,nx,1))
+        set!(model; ρ=ρ₀, T=T₀, qᵛ=qᵛ₀, u=Base.repeat(col(state.u),nx,nx,1), v=Base.repeat(col(state.v),nx,nx,1))
     end
     # Host interpolation gives set! a scalar, avoiding the GPU-indexing closure in the example.
     function refresh!(sim)

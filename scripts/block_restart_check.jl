@@ -20,7 +20,7 @@ prep = get(ENV, "ATLANTIC_RESTART", "prepare") == "prepare"
 fresh = get(ENV, "ATLANTIC_FRESH", "false") == "true"
 # ATLANTIC_EXTRA_STATE=true: checkpoint/restore the carried non-prognostic state found by restart_state_diff (17482):
 # anelastic pressure anomaly, microphysical surface_temperature, clock last_Δt/last_stage_Δt.
-extra_mode = get(ENV, "ATLANTIC_EXTRA_STATE", "false"); extra = extra_mode != "false"; rad_all = extra_mode == "radiation_all"
+extra_mode = get(ENV, "ATLANTIC_EXTRA_STATE", "false"); extra = extra_mode != "false"; rad_all = extra_mode in ("radiation_all", "model_all"); model_all = extra_mode == "model_all"
 # ATLANTIC_EXTRA_STATE=radiation_all: also every array leaf anywhere under model.radiation (workspace incl.
 # atmospheric_state / lookup stencil), restored by path — tests whether the radiation solve depends on its own history.
 function array_leaves!(out, x, path, seen, depth)
@@ -37,7 +37,9 @@ function array_leaves!(out, x, path, seen, depth)
     end
     return out
 end
-radiation_arrays(m) = array_leaves!(Dict{String, Any}(), m.radiation, "radiation", Set{UInt}(), 0)
+radiation_arrays(m) = model_all ? array_leaves!(Dict{String, Any}(), m, "model", Set{UInt}(), 0) :
+                                  array_leaves!(Dict{String, Any}(), m.radiation, "radiation", Set{UInt}(), 0)
+# model_all: EVERY storage array of the whole model (prognostic, auxiliary, timestepper, solver, forcing, radiation…)
 radiation_field_names(m) = [n for n in propertynames(m.radiation) if getproperty(m.radiation, n) isa Oceananigans.Fields.AbstractField]
 function extra_snapshot(m)
     d = Dict{String, Any}("last_Δt" => m.clock.last_Δt, "last_stage_Δt" => m.clock.last_stage_Δt)

@@ -20,7 +20,10 @@ prep = get(ENV, "ATLANTIC_RESTART", "prepare") == "prepare"
 fresh = get(ENV, "ATLANTIC_FRESH", "false") == "true"
 # ATLANTIC_EXTRA_STATE=true: checkpoint/restore the carried non-prognostic state found by restart_state_diff (17482):
 # anelastic pressure anomaly, microphysical surface_temperature, clock last_Δt/last_stage_Δt.
-extra_mode = get(ENV, "ATLANTIC_EXTRA_STATE", "false"); extra = extra_mode != "false"; rad_all = extra_mode in ("radiation_all", "model_all"); model_all = extra_mode == "model_all"
+extra_mode = get(ENV, "ATLANTIC_EXTRA_STATE", "false"); extra = extra_mode != "false"
+# model_re:<regex>: restore only whole-model storage arrays whose property path matches <regex> (bisection, 17510)
+model_re = startswith(extra_mode, "model_re:") ? Regex(extra_mode[10:end]) : nothing
+rad_all = extra_mode in ("radiation_all", "model_all") || !isnothing(model_re); model_all = extra_mode == "model_all" || !isnothing(model_re)
 # ATLANTIC_EXTRA_STATE=radiation_all: also every array leaf anywhere under model.radiation (workspace incl.
 # atmospheric_state / lookup stencil), restored by path — tests whether the radiation solve depends on its own history.
 function array_leaves!(out, x, path, seen, depth)
@@ -37,7 +40,7 @@ function array_leaves!(out, x, path, seen, depth)
     end
     return out
 end
-radiation_arrays(m) = model_all ? array_leaves!(Dict{String, Any}(), m, "model", Set{UInt}(), 0) :
+radiation_arrays(m) = model_all ? filter(kv -> isnothing(model_re) || occursin(model_re, first(kv)), array_leaves!(Dict{String, Any}(), m, "model", Set{UInt}(), 0)) :
                                   array_leaves!(Dict{String, Any}(), m.radiation, "radiation", Set{UInt}(), 0)
 # model_all: EVERY storage array of the whole model (prognostic, auxiliary, timestepper, solver, forcing, radiation…)
 radiation_field_names(m) = [n for n in propertynames(m.radiation) if getproperty(m.radiation, n) isa Oceananigans.Fields.AbstractField]

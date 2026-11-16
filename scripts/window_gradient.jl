@@ -168,7 +168,8 @@ function window_inputs(arch)
               energy_taper=on(padded(native.taper ./ 86400)), moisture_taper=on(padded(native.taper ./ (1000 * 86400))),
               Wsst=on(Wsst), sst_knots=on(sst_knots[active_knots]), cosz=on(cosz),
               lwp_weights=on(lwp_weights), dwp_weights=on(dwp_weights), ML=on(ML), MD=on(MD),
-              obs_L=on(obs_L[L_mask]), obs_D=on(obs_D[D_mask]), onehot=on(Matrix{Float64}(I(nrec))))
+              obs_L=on(obs_L[L_mask]), obs_D=on(obs_D[D_mask]), onehot=on(Matrix{Float64}(I(nrec))),
+              recidx=on(collect(1.0:nrec)), stepidx=on(collect(1.0:length(cosz))))
 end
 function window_objective(m, x, inp, Δt, loop)
     for (name, f) in pairs(prognostic_fields(m)); interior(f) .= inp.fields[String(name)]; end
@@ -178,8 +179,13 @@ function window_objective(m, x, inp, Δt, loop)
     reset!(m.clock); m.clock.time = inp.time
     initialize!(m); update_state!(m); prepare_first_time_step!(m, Δt)
     w = m.microphysical_fields
-    record(n) = (sum((interior(w.ρqᶜˡ) .+ interior(w.ρqʳ) .+ interior(w.ρqʷⁱ)) .* inp.lwp_weights) .* inp.onehot[:, n],
-                 sum(view(interior(w.ρqʳ), :, size(inp.dwp_weights, 1) ÷ 2, :) .* inp.dwp_weights[:, :, n]) .* inp.onehot[:, n])
+    # selections by masked reductions, never indexing with a traced loop counter
+    function record(n)
+        sel = ifelse.(inp.recidx .== n, 1.0, 0.0)
+        wd = dropdims(sum(inp.dwp_weights .* reshape(sel, 1, 1, :); dims=3); dims=3)
+        return (sum((interior(w.ρqᶜˡ) .+ interior(w.ρqʳ) .+ interior(w.ρqʷⁱ)) .* inp.lwp_weights) .* sel,
+                sum(view(interior(w.ρqʳ), :, size(inp.dwp_weights, 1) ÷ 2, :) .* wd) .* sel)
+    end
     l1, d1 = record(1); lwp = l1; dwp = d1
     a, b, c, e = loop
     @trace mincut=true checkpointing=true track_numbers=false for ia in 1:a
@@ -188,9 +194,10 @@ function window_objective(m, x, inp, Δt, loop)
             @trace mincut=true checkpointing=true track_numbers=false for ic in 1:c
                 @trace mincut=true checkpointing=true track_numbers=false for ie in 1:e
                     s = (mi - 1) * 60 + (ic - 1) * e + ie
-                    # length-1 slices, not scalar reads: GPU arrays natively, dynamic slices when traced
-                    parent(surface_temperature(m)) .= reshape(sst[s:s], 1, 1, 1)
-                    cos_zenith_array(m) .= reshape(inp.cosz[s:s], 1, 1)
+                    # masked reductions: traced ranges s:s fail (Reactant iota MethodError, job 17047)
+                    sel = ifelse.(inp.stepidx .== s, 1.0, 0.0)
+                    parent(surface_temperature(m)) .= sum(sst .* sel)
+                    cos_zenith_array(m) .= sum(inp.cosz .* sel)
                     time_step!(m, Δt)
                 end
             end
@@ -218,7 +225,7 @@ save() = open(io -> TOML.print(io, results), joinpath(output, "window_gradient.t
 
 # Native central differences of the same objective.
 fd = []
-for spec in split(get(ENV, "ATLANTIC_FD_DIRECTIONS", "1:0.01,1:0.003,3:0.01"), ",")
+for spec in filter(!isempty, split(get(ENV, "ATLANTIC_FD_DIRECTIONS", "1:0.01,1:0.003,3:0.01"), ","))
     k, ε = parse(Int, split(spec, ":")[1]), parse(Float64, split(spec, ":")[2])
     e = zeros(nx_controls); e[k] = ε
     Jp = J(x0 .+ e); Jm = J(x0 .- e)

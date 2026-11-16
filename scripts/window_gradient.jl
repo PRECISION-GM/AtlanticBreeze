@@ -171,7 +171,10 @@ function window_inputs(arch)
               obs_L=on(obs_L[L_mask]), obs_D=on(obs_D[D_mask]), onehot=on(Matrix{Float64}(I(nrec))),
               recidx=on(collect(1.0:nrec)), stepidx=on(collect(1.0:length(cosz))))
 end
-function window_objective(m, x, inp, Δt, loop)
+# ATLANTIC_CKPT: nested (mincut+checkpointing on all four loops) | nomincut | none — trace bisection (17115)
+const CKPT = get(ENV, "ATLANTIC_CKPT", "nested")
+const MC = CKPT == "nested"; const CP = CKPT != "none"
+@eval function window_objective(m, x, inp, Δt, loop)
     for (name, f) in pairs(prognostic_fields(m)); interior(f) .= inp.fields[String(name)]; end
     parent(energy_correction(m).data) .= inp.energy_taper .* reshape(x[1:1], 1, 1, 1, 1)
     parent(moisture_correction(m).data) .= inp.moisture_taper .* reshape(x[2:2], 1, 1, 1, 1)
@@ -188,11 +191,11 @@ function window_objective(m, x, inp, Δt, loop)
     end
     l1, d1 = record(1); lwp = l1; dwp = d1
     a, b, c, e = loop
-    @trace mincut=true checkpointing=true track_numbers=false for ia in 1:a
-        @trace mincut=true checkpointing=true track_numbers=false for ib in 1:b
+    @trace mincut=$MC checkpointing=$CP track_numbers=false for ia in 1:a
+        @trace mincut=$MC checkpointing=$CP track_numbers=false for ib in 1:b
             mi = (ia - 1) * b + ib
-            @trace mincut=true checkpointing=true track_numbers=false for ic in 1:c
-                @trace mincut=true checkpointing=true track_numbers=false for ie in 1:e
+            @trace mincut=$MC checkpointing=$CP track_numbers=false for ic in 1:c
+                @trace mincut=$MC checkpointing=$CP track_numbers=false for ie in 1:e
                     s = (mi - 1) * 60 + (ic - 1) * e + ie
                     # masked reductions: traced ranges s:s fail (Reactant iota MethodError, job 17047)
                     sel = ifelse.(inp.stepidx .== s, 1.0, 0.0)
@@ -244,7 +247,8 @@ options = Reactant.CompileOptions(raise=true, raise_first=true, sync=true, exclu
 results["reactant_build_s"] = build_r; save()
 note("tracing primal (code_hlo)"; build_r, gpu=gpu_memory())
 trace_s = @elapsed with_large_stack(() -> Reactant.@code_hlo compile_options=options window_objective(rmodel, x, rinputs, dt, loop))
-results["primal_trace_s"] = trace_s; save()
+results["primal_trace_s"] = trace_s; results["ckpt"] = CKPT; save()
+get(ENV, "ATLANTIC_TRACE_ONLY", "false") == "true" && (note("TRACE_OK"; trace_s, ckpt=CKPT); println("WINDOW_TRACE_DONE"); exit())
 note("compiling primal"; trace_s)
 pc = @elapsed cprimal = with_large_stack(() -> Reactant.@compile compile_options=options window_objective(rmodel, x, rinputs, dt, loop))
 t1 = @elapsed Jc = Float64(cprimal(rmodel, x, rinputs, dt, loop))

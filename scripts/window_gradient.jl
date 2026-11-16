@@ -230,6 +230,9 @@ end
 # ATLANTIC_CKPT: nested (mincut+checkpointing on all four loops) | nomincut | none — trace bisection (17115)
 const CKPT = get(ENV, "ATLANTIC_CKPT", "nested")
 const MC = CKPT == "nested"; const CP = CKPT != "none"
+# ATLANTIC_INDEX: captured (s, mi from enclosing loop counters) | clock (from m.clock.iteration; no traced
+# outer-loop values captured by inner loops) — isolation of the raise_triton_custom_call failure (17374, nx=8)
+const CLOCK_INDEX = get(ENV, "ATLANTIC_INDEX", "captured") == "clock"
 @eval function window_terms(m, x, inp, Δt, loop)
     for (name, f) in pairs(prognostic_fields(m)); interior(f) .= inp.fields[String(name)]; end
     if $(CONTROLS == "inputs")
@@ -258,7 +261,7 @@ const MC = CKPT == "nested"; const CP = CKPT != "none"
             mi = (ia - 1) * b + ib
             @trace mincut=$MC checkpointing=$CP track_numbers=false for ic in 1:c
                 @trace mincut=$MC checkpointing=$CP track_numbers=false for ie in 1:e
-                    s = (mi - 1) * 60 + (ic - 1) * e + ie
+                    s = $(CLOCK_INDEX) ? m.clock.iteration + 1 : (mi - 1) * 60 + (ic - 1) * e + ie
                     # masked reductions: traced ranges s:s fail (Reactant iota MethodError, job 17047)
                     sel = ifelse.(inp.stepidx .== s, 1.0, 0.0)
                     parent(surface_temperature(m)) .= sum(sst .* sel)
@@ -266,7 +269,7 @@ const MC = CKPT == "nested"; const CP = CKPT != "none"
                     time_step!(m, Δt)
                 end
             end
-            ln, dn = record(mi + 1); lwp = lwp .+ ln; dwp = dwp .+ dn
+            ln, dn = record($(CLOCK_INDEX) ? m.clock.iteration ÷ 60 + 1 : mi + 1); lwp = lwp .+ ln; dwp = dwp .+ dn
         end
     end
     rL = (inp.ML * lwp .- inp.obs_L) ./ 100; rD = inp.MD * dwp .- inp.obs_D

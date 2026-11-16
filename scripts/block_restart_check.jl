@@ -7,6 +7,7 @@
 #      ATLANTIC_RESTART (prepare: also call prepare_first_time_step! after restore, as window_objective does).
 include("model.jl")
 using Oceananigans: initialize!, prognostic_fields
+using Oceananigans.Architectures: on_architecture
 using Oceananigans.TimeSteppers: reset!, update_state!
 using Breeze.TimeSteppers: prepare_first_time_step!
 using Serialization

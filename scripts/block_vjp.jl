@@ -64,7 +64,7 @@ function block_primal(m, inp, Δt)
 end
 function block_seeded(m, inp, λ, Δt)
     block!(m, inp, Δt)
-    s = inp.gL[1] * lwp_of(m, inp) + sum(view(interior(m.microphysical_fields.ρqʳ), :, size(interior(m.microphysical_fields.ρqʳ), 1) ÷ 2, :) .* inp.gD)
+    s = sum(inp.gL) * lwp_of(m, inp)   # no scalar getindex on traced arrays (17387) + sum(view(interior(m.microphysical_fields.ρqʳ), :, size(interior(m.microphysical_fields.ρqʳ), 1) ÷ 2, :) .* inp.gD)
     for (n, f) in pairs(prognostic_fields(m)); s += sum(interior(f) .* λ[n]); end
     return s
 end
@@ -81,16 +81,19 @@ inp = (; sst=on(sst_block(1)), cosz=on(cosz_block(1)), stepidx=on(collect(1.0:B)
          lwp_weights=on(reshape(1000 .* dz ./ nx^2, 1, 1, :)), gL=on([1.0]), gD=on(zeros(nx, nz)))
 λ = NamedTuple{names_of(m)}(Tuple(on(zero(Array(interior(f)))) for f in values(prognostic_fields(m))))
 mlir_bytes() = sum(filesize(joinpath(output, "mlir", f)) for f in readdir(joinpath(output, "mlir")); init=0)
+# ATLANTIC_STRIP=true: strip_llvm_debuginfo (kernel debug info/locations, ~30% of the module text in 17374)
+strip = get(ENV, "ATLANTIC_STRIP", "false") == "true"
 opts = get(ENV, "ATLANTIC_RAISE", "true") == "true" ?
-    Reactant.CompileOptions(raise=true, raise_first=true, sync=true, excluded_passes=["concat_insert_dim_elementwise"]) :
-    Reactant.CompileOptions(raise=false, sync=true)
-cp = @elapsed cprimal = with_large_stack(() -> Reactant.@compile compile_options=opts block_primal(m, inp, dt))
+    Reactant.CompileOptions(raise=true, raise_first=true, sync=true, excluded_passes=["concat_insert_dim_elementwise"], strip_llvm_debuginfo=strip) :
+    Reactant.CompileOptions(raise=false, sync=true, strip_llvm_debuginfo=strip)
+phases = split(get(ENV, "ATLANTIC_PHASES", "primal,vjp"), ",")
+cp = "primal" in phases ? (@elapsed cprimal = with_large_stack(() -> Reactant.@compile compile_options=opts block_primal(m, inp, dt))) : NaN
 note("compiled block primal (single trace, no separate code_hlo)"; cp, mlir_MB=mlir_bytes() / 1e6)
 dm = Enzyme.make_zero(m)
-cv = @elapsed cvjp = with_large_stack(() -> Reactant.@compile compile_options=opts block_vjp!(m, dm, inp, λ, dt))
+cv = "vjp" in phases ? (@elapsed cvjp = with_large_stack(() -> Reactant.@compile compile_options=opts block_vjp!(m, dm, inp, λ, dt))) : NaN
 note("compiled block VJP"; cv, mlir_MB=mlir_bytes() / 1e6)
 # Executable reuse: the same cprimal/cvjp are called for every block with new same-shaped inputs.
 results = Dict{String, Any}("nx" => nx, "B" => B, "nb" => nb, "build_s" => build, "primal_compile_s" => cp, "vjp_compile_s" => cv,
-                            "dynamics" => string(rcase.dynamics), "commit" => get(ENV, "ATLANTIC_COMMIT", "unknown"))
+                            "dynamics" => string(rcase.dynamics), "strip_llvm_debuginfo" => strip, "phases" => join(phases, ","), "mlir_MB" => mlir_bytes() / 1e6, "commit" => get(ENV, "ATLANTIC_COMMIT", "unknown"))
 save() = open(io -> TOML.print(io, results), joinpath(output, "block_vjp.toml"), "w"); save()
 println("BLOCK_VJP_COMPILED")

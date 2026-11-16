@@ -64,7 +64,8 @@ function block_primal(m, inp, Δt)
 end
 function block_seeded(m, inp, λ, Δt)
     block!(m, inp, Δt)
-    s = sum(inp.gL) * lwp_of(m, inp)   # no scalar getindex on traced arrays (17387) + sum(view(interior(m.microphysical_fields.ρqʳ), :, size(interior(m.microphysical_fields.ρqʳ), 1) ÷ 2, :) .* inp.gD)
+    s = sum(inp.gL) * lwp_of(m, inp)   # sum(gL), not gL[1]: no scalar getindex on traced arrays (17387)
+    s += sum(view(interior(m.microphysical_fields.ρqʳ), :, size(interior(m.microphysical_fields.ρqʳ), 1) ÷ 2, :) .* inp.gD)   # DWP seed (restored: 8503336 commented it out)
     for (n, f) in pairs(prognostic_fields(m)); s += sum(interior(f) .* λ[n]); end
     return s
 end
@@ -78,7 +79,7 @@ end
 dz = diff(rcase.faces)
 on(a) = Reactant.to_rarray(a)
 inp = (; sst=on(sst_block(1)), cosz=on(cosz_block(1)), stepidx=on(collect(1.0:B)),
-         lwp_weights=on(reshape(1000 .* dz ./ nx^2, 1, 1, :)), gL=on([1.0]), gD=on(zeros(nx, nz)))
+         lwp_weights=on(reshape(1000 .* dz ./ nx^2, 1, 1, :)), gL=on([1.0]), gD=on(fill(1.0, nx, nz)))   # nonzero DWP seed so the term is exercised
 λ = NamedTuple{names_of(m)}(Tuple(on(zero(Array(interior(f)))) for f in values(prognostic_fields(m))))
 mlir_bytes() = sum(filesize(joinpath(output, "mlir", f)) for f in readdir(joinpath(output, "mlir")); init=0)
 # ATLANTIC_STRIP=true: strip_llvm_debuginfo (kernel debug info/locations, ~30% of the module text in 17374)

@@ -16,6 +16,8 @@ input = ENV["ATLANTIC_INPUT"]; saved = deserialize(ENV["ATLANTIC_STATE"])
 nx = parse(Int, get(ENV, "ATLANTIC_NX", "8")); dx = grid_spacing(100.0)
 B = parse(Int, get(ENV, "ATLANTIC_BLOCK", "60")); nb = parse(Int, get(ENV, "ATLANTIC_BLOCKS", "3")); dt = 1.0
 prep = get(ENV, "ATLANTIC_RESTART", "prepare") == "prepare"
+# ATLANTIC_FRESH=true: every restart uses a NEWLY BUILT model (no cache/history from the continuous run)
+fresh = get(ENV, "ATLANTIC_FRESH", "false") == "true"
 case = make_case(input; nx, dx, architecture=GPU()); m = case.model; t0 = saved.time
 surface_temperature(m) = m.radiation.surface_radiation.surface_temperature
 snapshot(m) = Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(m)))
@@ -31,6 +33,7 @@ continuous = Dict{Int, Any}()
 for b in 1:nb; for _ in 1:B; step!(m); end; continuous[b] = snapshot(m); end
 state = saved.fields
 for b in 1:nb
+    fresh && (global case = make_case(input; nx, dx, architecture=GPU()); global m = case.model)
     restore!(m, state, t0 + (b - 1) * B * dt, (b - 1) * B)
     for _ in 1:B; step!(m); end
     global state = snapshot(m)
@@ -38,4 +41,4 @@ for b in 1:nb
     worst = maximum(values(d))
     println("BLOCK $b worst_rel=$worst ", join(["$n=$(round(v; sigdigits=3))" for (n, v) in sort(collect(d); by=last, rev=true)[1:min(5, end)]], " "))
 end
-println("BLOCK_RESTART_CHECK_DONE prepare=$prep")
+println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh")

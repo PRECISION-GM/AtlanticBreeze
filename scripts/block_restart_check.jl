@@ -65,7 +65,20 @@ function extra_restore!(m, d)
     end
     m.clock.last_Δt = d["last_Δt"]; m.clock.last_stage_Δt = d["last_stage_Δt"]
 end
-case = make_case(input; nx, dx, architecture=GPU()); m = case.model; t0 = saved.time
+# ATLANTIC_INPUT_DELTA="T:1,q:-1,w:1,ug:1,vg:-1": nonzero forcing controls, multiples of the input-FD scales
+# (1 K/day, 1 g/kg/day, 1 mm/s, 0.1 m/s) × (1 − z/3 km)+ at every forcing knot, written into the model's own
+# input series (same plumbing as window_gradient inputs mode) for the continuous AND every fresh model.
+const INPUT_SCALE = Dict("T" => 1 / 86400, "q" => 1e-3 / 86400, "w" => 1e-3, "ug" => 0.1, "vg" => 0.1)
+deltas = [(String(a), parse(Float64, b)) for (a, b) in (split(s, ":") for s in filter(!isempty, split(get(ENV, "ATLANTIC_INPUT_DELTA", ""), ",")))]
+function build_case()
+    c = make_case(input; nx, dx, architecture=GPU())
+    for (f, a) in deltas
+        P = parent(getproperty(c.input_series, Symbol(f)).data); nz = length(c.z); off = (size(P, 3) - nz) ÷ 2
+        h = Array(P); h[1, 1, off+1:off+nz, :] .+= reshape(a .* INPUT_SCALE[f] .* clamp.(1 .- c.z ./ 3000, 0, 1), nz, 1); copyto!(P, h)
+    end
+    return c
+end
+case = build_case(); m = case.model; t0 = saved.time
 surface_temperature(m) = m.radiation.surface_radiation.surface_temperature
 snapshot(m) = Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(m)))
 # ATLANTIC_RAD_FIRST=true: write the radiation flux Fields of the previous block end BEFORE initialize!/update_state!,
@@ -88,7 +101,7 @@ extras = Dict{Int, Any}()
 for b in 1:nb; for _ in 1:B; step!(m); end; continuous[b] = snapshot(m); extras[b] = extra_snapshot(m); end
 state = saved.fields
 for b in 1:nb
-    fresh && (global case = make_case(input; nx, dx, architecture=GPU()); global m = case.model)
+    fresh && (global case = build_case(); global m = case.model)
     rad = rad_first && b > 1 ? Dict(n => extras[b - 1]["rad.$n"] for n in radiation_field_names(m)) : nothing
     restore!(m, state, t0 + (b - 1) * B * dt, (b - 1) * B; radiation=rad)
     extra && b > 1 && extra_restore!(m, extras[b - 1])   # from the continuous run's block end (what a checkpoint would store)
@@ -98,4 +111,4 @@ for b in 1:nb
     worst = maximum(values(d))
     println("BLOCK $b worst_rel=$worst ", join(["$n=$(round(v; sigdigits=3))" for (n, v) in sort(collect(d); by=last, rev=true)[1:min(5, end)]], " "))
 end
-println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra_mode rad_first=$rad_first radiation_fields=$(radiation_field_names(m))")
+println("BLOCK_RESTART_CHECK_DONE prepare=$prep fresh=$fresh extra=$extra_mode rad_first=$rad_first B=$B deltas=$deltas radiation_fields=$(radiation_field_names(m))")

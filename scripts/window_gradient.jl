@@ -225,7 +225,7 @@ function window_inputs(arch)
               lwp_weights=on(lwp_weights), dwp_weights=on(dwp_weights), ML=on(ML), MD=on(MD),
               obs_L=on(obs_L[L_mask]), obs_D=on(obs_D[D_mask]), onehot=on(Matrix{Float64}(I(nrec))),
               recidx=on(collect(1.0:nrec)), stepidx=on(collect(1.0:length(cosz))),
-              ci=control_inputs(arch), wLD=on([1.0, 1.0]))   # J = wL·J_LWP + wD·J_DWP (component gradients by reseeding)
+              ci=control_inputs(arch), wL=on([1.0]), wD=on([1.0]))   # J = wL·J_LWP + wD·J_DWP (component gradients by reseeding)
 end
 # ATLANTIC_CKPT: nested (mincut+checkpointing on all four loops) | nomincut | none — trace bisection (17115)
 const CKPT = get(ENV, "ATLANTIC_CKPT", "nested")
@@ -274,7 +274,7 @@ const MC = CKPT == "nested"; const CP = CKPT != "none"
 end
 function window_objective(m, x, inp, Δt, loop)
     JL, JD = window_terms(m, x, inp, Δt, loop)
-    return sum(inp.wLD .* [1.0, 0.0]) * JL + sum(inp.wLD .* [0.0, 1.0]) * JD
+    return sum(inp.wL) * JL + sum(inp.wD) * JD   # device weights (17354: host vector in a GPU broadcast)
 end
 # NOTE: the per-cell transect view uses the centre row like observation_sensitivity.jl (j = nx÷2).
 
@@ -370,7 +370,7 @@ g2 = @elapsed begin (Jg2, gg) = cgrad(rmodel, dmodel, x, gx, rinputs, dt, loop);
 results["gradient_repeat_identical"] = g == gg; results["J_gradient_primal"] = Jg
 CONTROLS == "inputs" || (results["gradient"] = g)
 if CONTROLS == "inputs"   # component gradients by reseeding the same compiled reverse program
-    comp(w) = (ri = merge(rinputs, (; wLD=Reactant.to_rarray(w))); Array(cgrad(rmodel, dmodel, x, gx, ri, dt, loop)[2]))
+    comp(w) = (ri = merge(rinputs, (; wL=Reactant.to_rarray(w[1:1]), wD=Reactant.to_rarray(w[2:2]))); Array(cgrad(rmodel, dmodel, x, gx, ri, dt, loop)[2]))
     gL = comp([1.0, 0.0]); gD = comp([0.0, 1.0])
     results["component_sum_rel"] = maximum(abs.(gL .+ gD .- g)) / max(maximum(abs.(g)), eps())
     results["input_fd_vs_ad"] = [merge(r, Dict("ad_dLWP" => sum(gL .* input_direction(r["field"], r["direction"])),

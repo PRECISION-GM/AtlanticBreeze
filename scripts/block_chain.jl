@@ -290,21 +290,42 @@ results = Dict{String,Any}(
     "commit" => get(ENV, "ATLANTIC_COMMIT", "unknown"),
 )
 save() = open(io -> TOML.print(io, results), joinpath(output, "block_chain.toml"), "w")
+
+# Comparison of two checkpoints (Codex 04:10 / 06:14 validation additions).
+# For every carried field and, for split-explicit dynamics, every stage tendency in Gⁿ:
+#     relative difference = max |candidate − reference| / max(max |reference|, eps())
+# (field-wise maximum norm, normalised by the reference field's own maximum), and whether the
+# candidate is finite everywhere. The worst value over all fields is what the gate below uses.
+function compare_checkpoints(candidate, reference)
+    relative_difference(a, b) = maximum(abs.(a .- b)) / max(maximum(abs.(b)), eps())
+    state_differences = Dict(String(n) => relative_difference(candidate.state[n], reference.state[n]) for n in keys(reference.state))
+    tendency_differences = Dict(String(n) => relative_difference(candidate.G[n], reference.G[n]) for n in keys(reference.G))
+    all_finite = all(all(isfinite, a) for a in values(candidate.state)) && all(all(isfinite, a) for a in values(candidate.G))
+    worst_state = maximum(values(state_differences))
+    worst_tendency = isempty(tendency_differences) ? 0.0 : maximum(values(tendency_differences))
+    return (; worst_state, worst_tendency, all_finite, state_differences, tendency_differences)
+end
+summary_line(c) = "state_worst_rel=$(c.worst_state) Gⁿ_worst_rel=$(c.worst_tendency) finite=$(c.all_finite)"
 x0 = zeros(number_of_controls)
 J0, native_checkpoints, native_records = native_chain(x0)
 note("native chain"; J0, carried = results["carried"])
 if "P1" in phases
+    # Same native model reloaded from its own checkpoints: tests checkpoint/load completeness, not a
+    # fresh-model restart (that evidence is block_restart_check.jl with ATLANTIC_FRESH=true).
     J1, restarted_checkpoints, _ = native_chain(x0; restart = true)
-    worst = maximum(
-        maximum(abs.(restarted_checkpoints[end].state[n] .- native_checkpoints[end].state[n])) /
-        max(maximum(abs.(native_checkpoints[end].state[n])), eps()) for
-        n in keys(native_checkpoints[end].state)
-    )
     results["P1_J_continuous"] = J0
     results["P1_J_restarted"] = J1
-    results["P1_state_worst_rel"] = worst
+    for b = 1:nb
+        comparison = compare_checkpoints(restarted_checkpoints[b+1], native_checkpoints[b+1])
+        results["P1_block$(b)"] = Dict(
+            "state_worst_rel" => comparison.worst_state,
+            "tendency_worst_rel" => comparison.worst_tendency,
+            "finite" => comparison.all_finite,
+        )
+        println("PHASE P1 block $b native restarted vs continuous: ", summary_line(comparison))
+    end
     save()
-    println("PHASE P1 native continuous vs restarted: J $J0 vs $J1, state worst_rel=$worst")
+    println("PHASE P1 native continuous vs restarted: J $J0 vs $J1")
 end
 fd = Dict{String,Any}()
 if "P3" in phases
@@ -408,18 +429,65 @@ if "P2" in phases
         relR =
             maximum(abs.(Array(R) .- native_records[b][2])) /
             max(maximum(abs.(native_records[b][2])), eps())
-        st = maximum(
-            maximum(abs.(Array(parent(f)) .- native_checkpoints[b+1].state[n])) /
-            max(maximum(abs.(native_checkpoints[b+1].state[n])), eps()) for
-            (n, f) in pairs(carried(reactant_model))
+        comparison = compare_checkpoints(snapshot(reactant_model), native_checkpoints[b+1])
+        results["P2_block$(b)"] = Dict(
+            "lwp_rel" => rel,
+            "rain_rel" => relR,
+            "state_worst_rel" => comparison.worst_state,
+            "tendency_worst_rel" => comparison.worst_tendency,
+            "finite" => comparison.all_finite && isfinite(Float64(L)),
+            "exec_s" => tb,
         )
-        results["P2_block$(b)"] =
-            Dict("lwp_rel" => rel, "rain_rel" => relR, "state_worst_rel" => st, "exec_s" => tb)
         save()
-        println(
-            "PHASE P2 block $b compiled vs native: lwp_rel=$rel rain_rel=$relR state_worst_rel=$st exec_s=$tb",
-        )
+        println("PHASE P2 block $b compiled vs native (reloaded checkpoint): lwp_rel=$rel rain_rel=$relR ",
+                summary_line(comparison), " exec_s=$tb")
     end
+
+    # Continuously chained compiled trajectory: load the window checkpoint once, then let the compiled
+    # block carry its own state (and, for split dynamics, its own Gⁿ) from block to block, with no native
+    # reloads, and compare every block end with the native chain.
+    load!(reactant_model, native_checkpoints[1], put_r!)
+    is_split(reactant_model) &&
+        foreach(n -> put_r!(reactant_tendencies[n], native_checkpoints[1].G[n]), keys(reactant_tendencies))
+    for b = 1:nb
+        if b > 1 && is_split(reactant_model)
+            compiled_state = snapshot(reactant_model)
+            foreach(n -> put_r!(reactant_tendencies[n], compiled_state.G[n]), keys(reactant_tendencies))
+        end
+        (L, R) = cprimal(reactant_model, reactant_tendencies, reactant_controls, reactant_block_inputs(b), dt)
+        comparison = compare_checkpoints(snapshot(reactant_model), native_checkpoints[b+1])
+        lwp_relative = abs(Float64(L) - native_records[b][1]) / max(abs(native_records[b][1]), eps())
+        results["P2_continuous_block$(b)"] = Dict(
+            "lwp_rel" => lwp_relative,
+            "state_worst_rel" => comparison.worst_state,
+            "tendency_worst_rel" => comparison.worst_tendency,
+            "finite" => comparison.all_finite && isfinite(Float64(L)),
+        )
+        save()
+        println("PHASE P2c block $b compiled continuous chain vs native: lwp_rel=$lwp_relative ", summary_line(comparison))
+    end
+end
+
+# Gate before the reverse compilation. The VJP is compiled only if every compiled block (reloaded and
+# continuously chained) is finite and agrees with the native chain to within ATLANTIC_PARITY_TOL
+# (default 1e-8, relative, field-wise maximum norm as in compare_checkpoints) for carried state and Gⁿ.
+# ATLANTIC_FORCE_VJP=true compiles anyway and labels the reverse results as compile-only diagnostics.
+parity_tolerance = parse(Float64, get(ENV, "ATLANTIC_PARITY_TOL", "1e-8"))
+parity_entries = [v for (k, v) in results if startswith(k, "P2_block") || startswith(k, "P2_continuous_block")]
+parity_passed =
+    !isempty(parity_entries) && all(
+        e["finite"] && e["state_worst_rel"] <= parity_tolerance && e["tendency_worst_rel"] <= parity_tolerance
+        for e in parity_entries
+    )
+force_vjp = get(ENV, "ATLANTIC_FORCE_VJP", "false") == "true"
+results["parity_tolerance"] = parity_tolerance
+results["parity_gate_passed"] = parity_passed
+results["reverse_scope"] = parity_passed ? "validated-primal" : (force_vjp ? "compile-only diagnostics (parity gate failed)" : "skipped (parity gate failed)")
+save()
+println("PHASE GATE parity_passed=$parity_passed tolerance=$parity_tolerance reverse_scope=$(results["reverse_scope"])")
+if "P3" in phases && !parity_passed && !force_vjp
+    println("BLOCK_CHAIN_DONE (reverse skipped: parity gate failed)")
+    exit()
 end
 if "P3" in phases
     model_adjoint = Enzyme.make_zero(reactant_model)

@@ -455,6 +455,8 @@ if "P2" in phases
             "state_worst_rel" => comparison.worst_state,
             "tendency_worst_rel" => comparison.worst_tendency,
             "finite" => comparison.all_finite && isfinite(Float64(L)) && all(isfinite, Array(R)),
+            "state_by_field" => comparison.state_differences,
+            "tendency_by_field" => comparison.tendency_differences,
             "exec_s" => tb,
         )
         save()

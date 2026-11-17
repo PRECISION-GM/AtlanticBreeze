@@ -16,7 +16,7 @@ include("model.jl")
 using Oceananigans: initialize!, prognostic_fields
 using Oceananigans.Architectures: ReactantState, on_architecture
 using Oceananigans.TimeSteppers: reset!, update_state!
-using Breeze.TimeSteppers: prepare_first_time_step!
+using Breeze.TimeSteppers: prepare_first_time_step!, prepare_acoustic_first_time_step!
 using Reactant: @trace
 using Serialization, Random
 
@@ -160,13 +160,32 @@ rain_of(m) = view(
     size(interior(m.microphysical_fields.ρqʳ), 1) ÷ 2,
     :,
 )
+# Block entry, written out explicitly so that native and compiled blocks run the same operations.
+# `prepare_first_time_step!` is not used here because it differs between architectures
+# (BreezeReactantExt/Timesteppers.jl; diagnosed from 17570/17571 P2):
+#   anelastic (SSP RK3): the Reactant method recomputes radiation at every call, while the native one
+#     does so only at iteration 0. Recomputing at a later block entry discards the carried fluxes
+#     (17570 block 2: 6.3e-5). Here: no radiation update at entry; the carried fluxes are used, and for
+#     block 1 they are the native initial fluxes of the fixed window state (independent of the controls).
+#   split explicit (acoustic RK3): the Reactant `maybe_prepare_first_time_step!` is a no-op, while the
+#     native one runs `prepare_acoustic_first_time_step!` (transport caches, last_stage_Δt) at iteration 0
+#     (17571 block 1: 4.9e-3). Here: call it explicitly at every entry, then write the carried Gⁿ for later
+#     blocks — the sequence validated by the fresh-model restart (17543, restore with prepare at
+#     iteration > 0 and non-finite last_stage_Δt).
+function enter_block!(m, Δt)
+    initialize!(m)
+    if is_split(m)
+        prepare_acoustic_first_time_step!(m, Δt, ())
+    else
+        m.clock.last_Δt = Δt
+        update_state!(m)
+    end
+    return nothing
+end
+
 function block_core!(m, G, x, inp, Δt)
     set_inputs!(m, x, inp.ci)
-    # Same entry sequence as the validated fresh restart (block_restart_check restore!): initialize!, update_state!,
-    # prepare_first_time_step!, then carried Gⁿ. 17560 P2 split block 1 (no initialize!) differed by 4.9e-3.
-    initialize!(m)
-    update_state!(m)
-    prepare_first_time_step!(m, Δt)
+    enter_block!(m, Δt)
     if is_split(m)   # carried split stage-1 tendencies (17543); useG = 0 in block 1 keeps the derived Gⁿ (its x-dependence differentiated)
         u = sum(inp.useG)
         for (g, gin) in zip(values(Gn(m)), values(G))
@@ -435,7 +454,7 @@ if "P2" in phases
             "rain_rel" => relR,
             "state_worst_rel" => comparison.worst_state,
             "tendency_worst_rel" => comparison.worst_tendency,
-            "finite" => comparison.all_finite && isfinite(Float64(L)),
+            "finite" => comparison.all_finite && isfinite(Float64(L)) && all(isfinite, Array(R)),
             "exec_s" => tb,
         )
         save()
@@ -457,30 +476,40 @@ if "P2" in phases
         (L, R) = cprimal(reactant_model, reactant_tendencies, reactant_controls, reactant_block_inputs(b), dt)
         comparison = compare_checkpoints(snapshot(reactant_model), native_checkpoints[b+1])
         lwp_relative = abs(Float64(L) - native_records[b][1]) / max(abs(native_records[b][1]), eps())
+        rain = Array(R)
+        rain_relative = maximum(abs.(rain .- native_records[b][2])) / max(maximum(abs.(native_records[b][2])), eps())
         results["P2_continuous_block$(b)"] = Dict(
             "lwp_rel" => lwp_relative,
+            "rain_rel" => rain_relative,
             "state_worst_rel" => comparison.worst_state,
             "tendency_worst_rel" => comparison.worst_tendency,
-            "finite" => comparison.all_finite && isfinite(Float64(L)),
+            "finite" => comparison.all_finite && isfinite(Float64(L)) && all(isfinite, rain),
         )
         save()
-        println("PHASE P2c block $b compiled continuous chain vs native: lwp_rel=$lwp_relative ", summary_line(comparison))
+        println("PHASE P2c block $b compiled continuous chain vs native: lwp_rel=$lwp_relative rain_rel=$rain_relative ",
+                summary_line(comparison))
     end
 end
 
 # Gate before the reverse compilation. The VJP is compiled only if every compiled block (reloaded and
-# continuously chained) is finite and agrees with the native chain to within ATLANTIC_PARITY_TOL
-# (default 1e-8, relative, field-wise maximum norm as in compare_checkpoints) for carried state and Gⁿ.
+# continuously chained) is finite — carried state, Gⁿ, the LWP record and every rain-transect element —
+# and agrees with the native chain to within
+#   ATLANTIC_PARITY_TOL (default 1e-8) for carried state and Gⁿ (field-wise maximum norm, compare_checkpoints), and
+#   ATLANTIC_RECORD_TOL (default 1e-8) for the records that seed the objective: |ΔLWP| / |LWP| and
+#   max |Δrain| / max |rain| over the transect (Codex 07:20: state agreement alone does not qualify objective parity).
 # ATLANTIC_FORCE_VJP=true compiles anyway and labels the reverse results as compile-only diagnostics.
 parity_tolerance = parse(Float64, get(ENV, "ATLANTIC_PARITY_TOL", "1e-8"))
+record_tolerance = parse(Float64, get(ENV, "ATLANTIC_RECORD_TOL", "1e-8"))
 parity_entries = [v for (k, v) in results if startswith(k, "P2_block") || startswith(k, "P2_continuous_block")]
 parity_passed =
     !isempty(parity_entries) && all(
-        e["finite"] && e["state_worst_rel"] <= parity_tolerance && e["tendency_worst_rel"] <= parity_tolerance
+        e["finite"] && e["state_worst_rel"] <= parity_tolerance && e["tendency_worst_rel"] <= parity_tolerance &&
+        e["lwp_rel"] <= record_tolerance && e["rain_rel"] <= record_tolerance
         for e in parity_entries
     )
 force_vjp = get(ENV, "ATLANTIC_FORCE_VJP", "false") == "true"
 results["parity_tolerance"] = parity_tolerance
+results["record_tolerance"] = record_tolerance
 results["parity_gate_passed"] = parity_passed
 results["reverse_scope"] = parity_passed ? "validated-primal" : (force_vjp ? "compile-only diagnostics (parity gate failed)" : "skipped (parity gate failed)")
 save()

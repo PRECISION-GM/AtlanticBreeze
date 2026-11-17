@@ -1,4 +1,6 @@
-# Shared forward model and observation loss. All times are seconds since sounding launch.
+# March 4, 2016 Eastern North Atlantic case.
+# Build the grid, physical parameterizations, forcing, and initial state.
+# All times are seconds since the 11:30 UTC sounding launch.
 using Breeze, Oceananigans, CUDA
 import NumericalRadiation
 import NCDatasets
@@ -8,224 +10,455 @@ using Oceananigans.BoundaryConditions: fill_halo_regions!
 using Dates, DelimitedFiles, Statistics, TOML, Random
 include(joinpath(pkgdir(Breeze), "examples", "lasso_ena", "LassoENA.jl"))
 const L = LassoENA
-readcsv(path) = readdlm(path, ',', Float64; skipstart=1)
+readcsv(path) = readdlm(path, ',', Float64; skipstart = 1)
 
 # aer1 matches March 4 surface UHSAS N(D>60 nm) ≈ 120–165 cm⁻³; LASSO aer2 is about twice that.
 advection_order() = parse(Int, get(ENV, "ATLANTIC_ORDER", "9"))   # 9 default; 5 is the authorized fallback
-grid_spacing(default=100.0) = parse(Float64, get(ENV, "ATLANTIC_DX", string(default)))  # input default otherwise
+grid_spacing(default = 100.0) = parse(Float64, get(ENV, "ATLANTIC_DX", string(default)))  # input default otherwise
 # Minimum halos Oceananigans accepted for these schemes (WENO9 rejects (5,5,5)).
-advection_halo(order) = order == 9 ? (6, 6, 5) : order == 5 ? (5, 5, 5) : error("ATLANTIC_ORDER must be 5 or 9")
+advection_halo(order) =
+    order == 9 ? (6, 6, 5) : order == 5 ? (5, 5, 5) : error("ATLANTIC_ORDER must be 5 or 9")
 const TAPER_TOP = 2500.0
 const ENA_COORDINATE = (-28.0257, 39.0916)  # (longitude, latitude) of the ARM ENA site
 
-function make_case(input; controls=zeros(2), nx=nothing, architecture=GPU(), aerosol_setting=:aer1,
-                   order=advection_order(), dx=nothing, solar_position=nothing, lookup_search=nothing,
-                   forcing_perturbation=identity, dynamics=Symbol(get(ENV, "ATLANTIC_DYNAMICS", "anelastic")))
-    dynamics in (:anelastic, :split_explicit) || error("ATLANTIC_DYNAMICS must be anelastic or split_explicit")
+function make_case(
+    input;
+    controls = zeros(2),
+    nx = nothing,
+    architecture = GPU(),
+    aerosol_setting = :aer1,
+    order = advection_order(),
+    dx = nothing,
+    solar_position = nothing,
+    lookup_search = nothing,
+    forcing_perturbation = identity,
+    dynamics = Symbol(get(ENV, "ATLANTIC_DYNAMICS", "anelastic")),
+)
+    dynamics in (:anelastic, :split_explicit) ||
+        error("ATLANTIC_DYNAMICS must be anelastic or split_explicit")
+    # Prepared observations and forcing
+
     config = TOML.parsefile(joinpath(input, "interval.toml"))
     isnothing(nx) && (nx = config["nx"])
     isnothing(dx) && (dx = grid_spacing(get(config, "dx", 100.0)))
     # Radiation every 30 s of model time whatever the step (30 iterations at 1 s, 60 at 0.5 s).
     radiation_iterations = round(Int, 30 / config["dt"])
-    radiation_iterations * config["dt"] ≈ 30 || error("dt=$(config["dt"]) does not divide the 30 s radiation cadence")
+    radiation_iterations * config["dt"] ≈ 30 ||
+        error("dt=$(config["dt"]) does not divide the 30 s radiation cadence")
     Oceananigans.defaults.FloatType = Float64
     faces = vec(readdlm(joinpath(input, "faces.csv"), ',', Float64))
     initial = readcsv(joinpath(input, "initial.csv"))
     # forcing_perturbation(matrix) returns a modified copy (sensitivity experiments); identity otherwise.
     forcing_data = forcing_perturbation(readcsv(joinpath(input, "forcing.csv")))
-    z = initial[:, 1]; nz = length(z); times = unique(forcing_data[:, 1])
-    grid = RectilinearGrid(architecture, Float64; size=(nx, nx, nz), x=(0, nx*dx), y=(0, nx*dx),
-                          z=faces, halo=advection_halo(order), topology=(Periodic, Periodic, Bounded))
+    z = initial[:, 1]
+    nz = length(z)
+    times = unique(forcing_data[:, 1])
+    # Domain and grid
+
+    grid = RectilinearGrid(
+        architecture,
+        Float64;
+        size = (nx, nx, nz),
+        x = (0, nx*dx),
+        y = (0, nx*dx),
+        z = faces,
+        halo = advection_halo(order),
+        topology = (Periodic, Periodic, Bounded),
+    )
+    # Sounding reference state
+
     constants = Breeze.ThermodynamicConstants(Float64)
-    profiles = L.SoundingProfiles(z, initial[:,3], initial[:,4], initial[:,5], initial[:,6],
-                                  initial[1,2]*exp(9.80665*z[1]/(287.05*initial[1,3]*(initial[1,2]/1e5)^0.2857)), false)
-    reference = L.sounding_reference_state(grid, profiles, constants)
-    pressure = Array(interior(reference.pressure, 1, 1, :))
-    density = Array(interior(reference.density, 1, 1, :))
-    aerosol = L.lasso_aerosol(; setting=aerosol_setting, reference_density=density[1], maximum_supersaturation=0.003)
-    microphysics = P3Microphysics(; cloud=L.CloudDroplets(; number_concentration=75e6), aerosol)
-    columns(c) = [forcing_data[forcing_data[:,1].==t,c] for t in times]
-    series(c) = L.profile_time_series(grid,times,columns(c))
+    profiles = L.SoundingProfiles(
+        z,
+        initial[:, 3],
+        initial[:, 4],
+        initial[:, 5],
+        initial[:, 6],
+        initial[1, 2]*exp(9.80665*z[1]/(287.05*initial[1, 3]*(initial[1, 2]/1e5)^0.2857)),
+        false,
+    )
+    reference_state = L.sounding_reference_state(grid, profiles, constants)
+    pressure = Array(interior(reference_state.pressure, 1, 1, :))
+    density = Array(interior(reference_state.density, 1, 1, :))
+    # Cloud microphysics and prognostic aerosol
+
+    aerosol = L.lasso_aerosol(;
+        setting = aerosol_setting,
+        reference_density = density[1],
+        maximum_supersaturation = 0.003,
+    )
+    microphysics = P3Microphysics(; cloud = L.CloudDroplets(; number_concentration = 75e6), aerosol)
+    # Height-dependent, time-varying large-scale forcing
+
+    columns(c) = [forcing_data[forcing_data[:, 1] .== t, c] for t in times]
+    series(c) = L.profile_time_series(grid, times, columns(c))
     # Native forcing input arrays (height × hourly knot), kept by reference so input-gradient scripts can
     # write perturbations into the same FieldTimeSeries the forcing operators read (window_gradient.jl inputs mode).
-    input_series = (; T=series(3), q=series(4), w=series(5), ug=series(6), vg=series(7))
-    thermo = L.large_scale_thermodynamic_forcings(input_series.T, input_series.q; microphysics, thermodynamic_constants=constants,
-        moisture_name=:qᵛ, moisture_basis=:mass_fraction)
+    input_series = (; T = series(3), q = series(4), w = series(5), ug = series(6), vg = series(7))
+    thermodynamic_forcing = L.large_scale_thermodynamic_forcings(
+        input_series.T,
+        input_series.q;
+        microphysics,
+        thermodynamic_constants = constants,
+        moisture_name = :qᵛ,
+        moisture_basis = :mass_fraction,
+    )
     # Controls: added dT/dt [K/day] and dq/dt [g/kg/day], tapered out by 2500 m. They are a separate,
     # linear, time-constant forcing whose profiles the model owns, so a differentiated program can set
     # them from traced controls (set_controls!) instead of baking them into the ERA5 series.
-    taper = clamp.((TAPER_TOP .- z)./1000, 0, 1)
+    taper = clamp.((TAPER_TOP .- z) ./ 1000, 0, 1)
     knots = [-1e6, 1e6]
     correction = L.large_scale_thermodynamic_forcings(
-        L.profile_time_series(grid,knots,fill(controls[1].*taper./86400,2)),
-        L.profile_time_series(grid,knots,fill(controls[2].*taper./(1000*86400),2));
-        microphysics, thermodynamic_constants=constants, moisture_name=:qᵛ, moisture_basis=:mass_fraction)
-    geostrophic = L.time_varying_geostrophic_forcings(input_series.ug,input_series.vg)
+        L.profile_time_series(grid, knots, fill(controls[1] .* taper ./ 86400, 2)),
+        L.profile_time_series(grid, knots, fill(controls[2] .* taper ./ (1000*86400), 2));
+        microphysics,
+        thermodynamic_constants = constants,
+        moisture_name = :qᵛ,
+        moisture_basis = :mass_fraction,
+    )
+    geostrophic = L.time_varying_geostrophic_forcings(input_series.ug, input_series.vg)
     subsidence = L.LargeScaleVerticalAdvection(input_series.w)
-    sponge = L.SAMSponge(; damping_depth_fraction=0.2)
-    forcing = Dict{Symbol,Tuple}(:u=>(geostrophic.u,subsidence,sponge),
-        :v=>(geostrophic.v,subsidence,sponge), :w=>(sponge,), :E=>(thermo.E,correction.E), :θ=>(subsidence,))
-    for name in L.specific_prognostic_names(microphysics); forcing[name]=(subsidence,); end
-    forcing[:qᵛ]=(thermo.qᵛ,subsidence,correction.qᵛ)  # correction last: see set_controls!
+    sponge = L.SAMSponge(; damping_depth_fraction = 0.2)
+    forcing = Dict{Symbol,Tuple}(
+        :u=>(geostrophic.u, subsidence, sponge),
+        :v=>(geostrophic.v, subsidence, sponge),
+        :w=>(sponge,),
+        :E=>(thermodynamic_forcing.E, correction.E),
+        :θ=>(subsidence,),
+    )
+    for name in L.specific_prognostic_names(microphysics)
+        forcing[name]=(subsidence,)
+    end
+    forcing[:qᵛ]=(thermodynamic_forcing.qᵛ, subsidence, correction.qᵛ)  # correction last: see set_controls!
+    # Prescribed sea-surface temperature and interactive surface fluxes
+
     sst_values=[first(c) for c in columns(8)]
     surface_temperature=Field{Center,Center,Nothing}(grid)
-    set!(surface_temperature,L.interpolate_profile(times,sst_values,0))
+    set!(surface_temperature, L.interpolate_profile(times, sst_values, 0))
     fill_halo_regions!(surface_temperature)
-    surface_density=L.sam_surface_interface_density(pressure,z,constants.gravitational_acceleration)
-    boundary_conditions=L.sam_ocean_surface_flux_boundary_conditions(grid,surface_temperature;
-        moisture_name=:qᵛ,microphysics,thermodynamic_constants=constants,surface_density)
-    radiation=RadiativeTransferModel(grid,EcCKDOptics(; clouds=CloudScatteringTables(), lookup_search),constants;
-        surface_temperature,surface_albedo=0.07,surface_emissivity=0.95,
-        background_atmosphere=BackgroundAtmosphere(CO₂=405e-6,CH₄=1.85e-6,N₂O=330e-9),
+    surface_density=L.sam_surface_interface_density(
+        pressure,
+        z,
+        constants.gravitational_acceleration,
+    )
+    boundary_conditions=L.sam_ocean_surface_flux_boundary_conditions(
+        grid,
+        surface_temperature;
+        moisture_name = :qᵛ,
+        microphysics,
+        thermodynamic_constants = constants,
+        surface_density,
+    )
+    # Radiation, including the atmosphere above the simulation domain
+
+    radiation=RadiativeTransferModel(
+        grid,
+        EcCKDOptics(; clouds = CloudScatteringTables(), lookup_search),
+        constants;
+        surface_temperature,
+        surface_albedo = 0.07,
+        surface_emissivity = 0.95,
+        background_atmosphere = BackgroundAtmosphere(CO₂ = 405e-6, CH₄ = 1.85e-6, N₂O = 330e-9),
         # The gradient check passes a FixedCosineZenith: ApparentSolarPosition builds a DateTime from the clock,
         # which Reactant cannot trace.
-        solar_position=something(solar_position,ApparentSolarPosition(;coordinate=ENA_COORDINATE,epoch=DateTime(config["epoch"]))),
-        schedule=IterationInterval(radiation_iterations),liquid_effective_radius=ConstantRadiusParticles(14e-6),
-        ice_effective_radius=ConstantRadiusParticles(30e-6),
+        solar_position = something(
+            solar_position,
+            ApparentSolarPosition(; coordinate = ENA_COORDINATE, epoch = DateTime(config["epoch"])),
+        ),
+        schedule = IterationInterval(radiation_iterations),
+        liquid_effective_radius = ConstantRadiusParticles(14e-6),
+        ice_effective_radius = ConstantRadiusParticles(30e-6),
         # Radiation sees a continued column above the 8 km LES top: 40 layers to 65 km, standard-atmosphere
         # T/q anchored to the grid-top temperature, and the background standard ozone profile.
-        overlying_atmosphere=OverlyingAtmosphereColumn(Float64; top=65e3, layers=40))
+        overlying_atmosphere = OverlyingAtmosphereColumn(Float64; top = 65e3, layers = 40),
+    )
     # Split-explicit compressible: Breeze's SplitExplicitTimeDiscretization (WS-RK3 outer, acoustic
     # substeps from acoustic_cfl unless ATLANTIC_SUBSTEPS is given, thermal divergence damping 0.1) on an
     # Exner reference built from the same sounding θ and qᵗ profiles and surface pressure. The anelastic
     # reference above still supplies the column density used by forcing/aerosol/surface-flux conversions.
+    # Dynamics and model
+
     substeps = haskey(ENV, "ATLANTIC_SUBSTEPS") ? parse(Int, ENV["ATLANTIC_SUBSTEPS"]) : nothing
-    dyn = dynamics === :anelastic ? AnelasticDynamics(reference) :
-        CompressibleDynamics(SplitExplicitTimeDiscretization(; substeps); base_pressure=profiles.surface_pressure,
-            reference_potential_temperature=z -> profiles(:θ, z), reference_vapor_mass_fraction=z -> profiles(:qᵗ, z))
-    model=AtmosphereModel(grid; dynamics=dyn,formulation=:LiquidIcePotentialTemperature,
-        microphysics,radiation,forcing=L.compact_forcing(forcing),boundary_conditions,thermodynamic_constants=constants,
-        coriolis=FPlane(f=9.19626e-5),closure=nothing,momentum_advection=WENO(; order),
-        scalar_advection=L.scalar_advection_schemes(order,microphysics,:qᵛ))
-    state=L.initial_state_columns(profiles,z,pressure;constants)
+    model_dynamics =
+        dynamics === :anelastic ? AnelasticDynamics(reference_state) :
+        CompressibleDynamics(
+            SplitExplicitTimeDiscretization(; substeps);
+            base_pressure = profiles.surface_pressure,
+            reference_potential_temperature = z -> profiles(:θ, z),
+            reference_vapor_mass_fraction = z -> profiles(:qᵗ, z),
+        )
+    model=AtmosphereModel(
+        grid;
+        dynamics = model_dynamics,
+        formulation = :LiquidIcePotentialTemperature,
+        microphysics,
+        radiation,
+        forcing = L.compact_forcing(forcing),
+        boundary_conditions,
+        thermodynamic_constants = constants,
+        coriolis = FPlane(f = 9.19626e-5),
+        closure = nothing,
+        momentum_advection = WENO(; order),
+        scalar_advection = L.scalar_advection_schemes(order, microphysics, :qᵛ),
+    )
+    # Condensate-free initial conditions
+
+    state=L.initial_state_columns(profiles, z, pressure; constants)
     # The observations are dry theta, not Breeze liquid-ice theta. Initialize via T.
-    state=merge(state,(;T_condensate_free=initial[:,3].*(pressure./1e5).^0.2857))
-    perturbation=L.InitialPerturbation(;seed=3042016)
+    state=merge(state, (; T_condensate_free = initial[:, 3] .* (pressure ./ 1e5) .^ 0.2857))
+    perturbation=L.InitialPerturbation(; seed = 3042016)
     if dynamics === :anelastic
-        L.set_sounding_initial_state!(model,state;perturbation,moisture_basis=:mass_fraction,initialization=:condensate_free)
+        L.set_sounding_initial_state!(
+            model,
+            state;
+            perturbation,
+            moisture_basis = :mass_fraction,
+            initialization = :condensate_free,
+        )
     else
         # Same perturbed condensate-free T, qᵛ, u, v as set_sounding_initial_state!, plus a total density
         # in pressure balance with the model's own Exner reference pressure: ρ = p_ref / (Rᵐ T₀).
-        Nz=length(z); col(v)=reshape(v,1,1,Nz)
-        ϵ=L.perturbation_array(nx,nx,z,perturbation); δT,δq=L.perturbation_amplitudes(perturbation,z)
-        T₀=col(state.T_condensate_free).+col(δT).*ϵ; qᵛ₀=max.(0,col(state.qᵗ).+col(δq).*ϵ)
-        Rd=Breeze.Thermodynamics.dry_air_gas_constant(constants); Rv=Breeze.Thermodynamics.vapor_gas_constant(constants)
-        p_ref=col(Array(interior(model.dynamics.reference_state.pressure,1,1,:)))
-        ρ₀=p_ref./((Rd.*(1 .-qᵛ₀).+Rv.*qᵛ₀).*T₀)
-        set!(model; ρ=ρ₀, T=T₀, qᵛ=qᵛ₀, u=Base.repeat(col(state.u),nx,nx,1), v=Base.repeat(col(state.v),nx,nx,1))
+        Nz=length(z)
+        col(v) = reshape(v, 1, 1, Nz)
+        ϵ=L.perturbation_array(nx, nx, z, perturbation)
+        δT, δq=L.perturbation_amplitudes(perturbation, z)
+        T₀=col(state.T_condensate_free) .+ col(δT) .* ϵ
+        qᵛ₀=max.(0, col(state.qᵗ) .+ col(δq) .* ϵ)
+        Rd=Breeze.Thermodynamics.dry_air_gas_constant(constants)
+        Rv=Breeze.Thermodynamics.vapor_gas_constant(constants)
+        p_ref=col(Array(interior(model.dynamics.reference_state.pressure, 1, 1, :)))
+        ρ₀=p_ref ./ ((Rd .* (1 .- qᵛ₀) .+ Rv .* qᵛ₀) .* T₀)
+        set!(
+            model;
+            ρ = ρ₀,
+            T = T₀,
+            qᵛ = qᵛ₀,
+            u = Base.repeat(col(state.u), nx, nx, 1),
+            v = Base.repeat(col(state.v), nx, nx, 1),
+        )
     end
     # Host interpolation gives set! a scalar, avoiding the GPU-indexing closure in the example.
     function refresh!(sim)
-        set!(surface_temperature,L.interpolate_profile(times,sst_values,sim.model.clock.time))
+        set!(surface_temperature, L.interpolate_profile(times, sst_values, sim.model.clock.time))
         fill_halo_regions!(surface_temperature)
     end
-    return (;model,config,z,faces,pressure,density,refresh!,taper,order,dx,radiation_iterations,dynamics,input_series,forcing_times=times)
+    return (;
+        model,
+        config,
+        z,
+        faces,
+        pressure,
+        density,
+        refresh!,
+        taper,
+        order,
+        dx,
+        radiation_iterations,
+        dynamics,
+        input_series,
+        forcing_times = times,
+    )
 end
 
 # Domain-mean profiles (theta, qv, cloud and total liquid, cloud fraction, w variance), the LWP map and
 # x-z slices of liquid and w through the domain centre, appended along an unlimited time dimension.
 # Cloud fraction counts cells with cloud liquid above 1e-5 kg/kg.
-function diagnostics_writer(case,path)
-    grid=case.model.grid; nx,ny,nz=size(grid); dz=diff(case.faces); ρ=reshape(case.density,1,1,:)
-    NCDatasets.NCDataset(path,"c") do ds
-        NCDatasets.defDim(ds,"x",nx); NCDatasets.defDim(ds,"y",ny); NCDatasets.defDim(ds,"z",nz); NCDatasets.defDim(ds,"time",Inf)
-        NCDatasets.defVar(ds,"z",case.z,("z",); attrib=["units"=>"m"]); NCDatasets.defVar(ds,"x",((1:nx).-0.5).*case.dx,("x",); attrib=["units"=>"m"])
-        NCDatasets.defVar(ds,"time",Float64,("time",); attrib=["units"=>"s since sounding launch"])
-        for (n,u) in (("theta","K"),("qv","kg/kg"),("qc","kg/kg"),("ql","kg/kg"),("cloud_fraction","1"),("w_variance","m2/s2"))
-            NCDatasets.defVar(ds,n,Float32,("z","time"); attrib=["units"=>u])
+function diagnostics_writer(case, path)
+    grid=case.model.grid
+    nx, ny, nz=size(grid)
+    dz=diff(case.faces)
+    ρ=reshape(case.density, 1, 1, :)
+    NCDatasets.NCDataset(path, "c") do ds
+        NCDatasets.defDim(ds, "x", nx)
+        NCDatasets.defDim(ds, "y", ny)
+        NCDatasets.defDim(ds, "z", nz)
+        NCDatasets.defDim(ds, "time", Inf)
+        NCDatasets.defVar(ds, "z", case.z, ("z",); attrib = ["units"=>"m"])
+        NCDatasets.defVar(ds, "x", ((1:nx) .- 0.5) .* case.dx, ("x",); attrib = ["units"=>"m"])
+        NCDatasets.defVar(
+            ds,
+            "time",
+            Float64,
+            ("time",);
+            attrib = ["units"=>"s since sounding launch"],
+        )
+        for (n, u) in (
+            ("theta", "K"),
+            ("qv", "kg/kg"),
+            ("qc", "kg/kg"),
+            ("ql", "kg/kg"),
+            ("cloud_fraction", "1"),
+            ("w_variance", "m2/s2"),
+        )
+            NCDatasets.defVar(ds, n, Float32, ("z", "time"); attrib = ["units"=>u])
         end
-        NCDatasets.defVar(ds,"lwp",Float32,("x","y","time"); attrib=["units"=>"g/m2","comment"=>"cloud+rain+ice liquid coating"])
-        NCDatasets.defVar(ds,"ql_xz",Float32,("x","z","time"); attrib=["units"=>"kg/kg"])
-        NCDatasets.defVar(ds,"w_xz",Float32,("x","z","time"); attrib=["units"=>"m/s","comment"=>"w at cell centres"])
+        NCDatasets.defVar(
+            ds,
+            "lwp",
+            Float32,
+            ("x", "y", "time");
+            attrib = ["units"=>"g/m2", "comment"=>"cloud+rain+ice liquid coating"],
+        )
+        NCDatasets.defVar(ds, "ql_xz", Float32, ("x", "z", "time"); attrib = ["units"=>"kg/kg"])
+        NCDatasets.defVar(
+            ds,
+            "w_xz",
+            Float32,
+            ("x", "z", "time");
+            attrib = ["units"=>"m/s", "comment"=>"w at cell centres"],
+        )
     end
     function write(sim)
-        m=sim.model; water=m.microphysical_fields; j=ny÷2
+        m=sim.model
+        water=m.microphysical_fields
+        j=ny÷2
         cloud=Array(interior(water.ρqᶜˡ))
-        liquid=cloud.+Array(interior(water.ρqʳ)).+Array(interior(water.ρqʷⁱ))
-        wf=Array(interior(m.velocities.w)); wc=(wf[:,:,1:end-1].+wf[:,:,2:end])./2
-        profile(a)=vec(mean(a;dims=(1,2)))
-        NCDatasets.NCDataset(path,"a") do ds
+        liquid=cloud .+ Array(interior(water.ρqʳ)) .+ Array(interior(water.ρqʷⁱ))
+        wf=Array(interior(m.velocities.w))
+        wc=(wf[:, :, 1:(end-1)] .+ wf[:, :, 2:end]) ./ 2
+        profile(a) = vec(mean(a; dims = (1, 2)))
+        NCDatasets.NCDataset(path, "a") do ds
             n=length(ds["time"])+1
             ds["time"][n]=m.clock.time
-            ds["theta"][:,n]=profile(Array(interior(m.temperature))).*(1e5./case.pressure).^0.2857
-            ds["qv"][:,n]=profile(Array(interior(water.qᵛ)))
-            ds["qc"][:,n]=profile(cloud./ρ); ds["ql"][:,n]=profile(liquid./ρ)
-            ds["cloud_fraction"][:,n]=profile(cloud./ρ .> 1e-5)
-            ds["w_variance"][:,n]=profile(wc.^2).-profile(wc).^2
-            ds["lwp"][:,:,n]=1000 .*dropdims(sum(liquid.*reshape(dz,1,1,:);dims=3);dims=3)
-            ds["ql_xz"][:,:,n]=liquid[:,j,:]./reshape(case.density,1,:); ds["w_xz"][:,:,n]=wc[:,j,:]
+            ds["theta"][:, n]=profile(Array(interior(m.temperature))) .*
+                              (1e5 ./ case.pressure) .^ 0.2857
+            ds["qv"][:, n]=profile(Array(interior(water.qᵛ)))
+            ds["qc"][:, n]=profile(cloud ./ ρ)
+            ds["ql"][:, n]=profile(liquid ./ ρ)
+            ds["cloud_fraction"][:, n]=profile(cloud ./ ρ .> 1e-5)
+            ds["w_variance"][:, n]=profile(wc .^ 2) .- profile(wc) .^ 2
+            ds["lwp"][:, :, n]=1000 .*
+                               dropdims(sum(liquid .* reshape(dz, 1, 1, :); dims = 3); dims = 3)
+            ds["ql_xz"][:, :, n]=liquid[:, j, :] ./ reshape(case.density, 1, :)
+            ds["w_xz"][:, :, n]=wc[:, j, :]
         end
     end
     return write
 end
 
-function forecast(input, output; controls=zeros(2), stop_time=nothing, nx=nothing, cpu=false,
-                  aerosol_setting=Symbol(get(ENV,"ATLANTIC_AEROSOL","aer1")))
+function forecast(
+    input,
+    output;
+    controls = zeros(2),
+    stop_time = nothing,
+    nx = nothing,
+    cpu = false,
+    aerosol_setting = Symbol(get(ENV, "ATLANTIC_AEROSOL", "aer1")),
+)
     isdir(output) && !isempty(readdir(output)) && error("Output directory is not empty: $output")
     mkpath(output)
-    wall0=time()
-    case=make_case(input;controls,nx,architecture=cpu ? CPU() : GPU(),aerosol_setting)
-    model=case.model; config=case.config
-    duration=isnothing(stop_time) ? config["duration"] : min(stop_time,config["duration"])
-    meta=Dict{String,Any}("duration"=>duration,"complete_interval"=>false,"loss"=>NaN,
-        "temperature_correction_Kday"=>controls[1],"moisture_correction_gkgday"=>controls[2],"nx"=>size(model.grid,1),"dx_m"=>case.dx,"domain_m"=>size(model.grid,1)*case.dx,"order"=>case.order,"halo"=>collect(advection_halo(case.order)),
-        "input"=>abspath(input),"precision"=>"Float64","aerosol"=>"prognostic","aerosol_setting"=>string(aerosol_setting),
-        "dt"=>config["dt"],"dynamics"=>string(case.dynamics),"substeps"=>get(ENV,"ATLANTIC_SUBSTEPS","auto (acoustic_cfl 0.5)"),"advection"=>"WENO$(case.order) momentum and scalars","closure"=>"none (implicit WENO dissipation)","commit"=>get(ENV,"ATLANTIC_COMMIT","unknown"))
-    writemeta()=open(io->TOML.print(io,meta),joinpath(output,"run.toml"),"w")
+    start_time=time()
+    case=make_case(input; controls, nx, architecture = cpu ? CPU() : GPU(), aerosol_setting)
+    model=case.model
+    config=case.config
+    duration=isnothing(stop_time) ? config["duration"] : min(stop_time, config["duration"])
+    metadata=Dict{String,Any}(
+        "duration"=>duration,
+        "complete_interval"=>false,
+        "loss"=>NaN,
+        "temperature_correction_Kday"=>controls[1],
+        "moisture_correction_gkgday"=>controls[2],
+        "nx"=>size(model.grid, 1),
+        "dx_m"=>case.dx,
+        "domain_m"=>size(model.grid, 1)*case.dx,
+        "order"=>case.order,
+        "halo"=>collect(advection_halo(case.order)),
+        "input"=>abspath(input),
+        "precision"=>"Float64",
+        "aerosol"=>"prognostic",
+        "aerosol_setting"=>string(aerosol_setting),
+        "dt"=>config["dt"],
+        "dynamics"=>string(case.dynamics),
+        "substeps"=>get(ENV, "ATLANTIC_SUBSTEPS", "auto (acoustic_cfl 0.5)"),
+        "advection"=>"WENO$(case.order) momentum and scalars",
+        "closure"=>"none (implicit WENO dissipation)",
+        "commit"=>get(ENV, "ATLANTIC_COMMIT", "unknown"),
+    )
+    writemeta() = open(io->TOML.print(io, metadata), joinpath(output, "run.toml"), "w")
     writemeta()  # Records an incomplete run until the end is reached.
-    simulation=Simulation(model;Δt=config["dt"],stop_time=duration)
-    add_callback!(simulation,case.refresh!,IterationInterval(1))
+    simulation=Simulation(model; Δt = config["dt"], stop_time = duration)
+    add_callback!(simulation, case.refresh!, IterationInterval(1))
     records=Vector{Float64}[]
     header=["time_s" "LWP_gm2" "max_abs_u_ms" "max_abs_w_ms" "cfl" "wall_s"]
     Δzmin=minimum(diff(case.faces))
     function diagnose(sim)
-        m=sim.model; water=m.microphysical_fields
+        m=sim.model
+        water=m.microphysical_fields
         # Total P3 liquid includes rain and liquid coating on ice.
         liquid=Array(interior(water.ρqᶜˡ))+Array(interior(water.ρqʳ))+Array(interior(water.ρqʷⁱ))
-        lwp=1000sum(vec(mean(liquid;dims=(1,2))).*diff(case.faces))
-        U=max(maximum(abs,interior(m.velocities.u)),maximum(abs,interior(m.velocities.v)))
-        W=maximum(abs,interior(m.velocities.w))
+        lwp=1000sum(vec(mean(liquid; dims = (1, 2))) .* diff(case.faces))
+        U=max(maximum(abs, interior(m.velocities.u)), maximum(abs, interior(m.velocities.v)))
+        W=maximum(abs, interior(m.velocities.w))
         cfl=config["dt"]*(2U/case.dx+W/Δzmin)
-        row=[m.clock.time,lwp,U,W,cfl,time()-wall0]
-        all(isfinite,row) || error("Nonfinite diagnostics at t=$(m.clock.time)")
+        row=[m.clock.time, lwp, U, W, cfl, time()-start_time]
+        all(isfinite, row) || error("Nonfinite diagnostics at t=$(m.clock.time)")
         cfl<0.8 || error("CFL $(cfl) exceeds 0.8 at t=$(m.clock.time)")
-        push!(records,row); @info "forward" time=m.clock.time lwp W cfl wall=row[end]
+        push!(records, row)
+        @info "forward" time=m.clock.time lwp W cfl wall=row[end]
         # Rewritten every minute: an interrupted run keeps its history (no restart is claimed).
-        writedlm(joinpath(output,"lwp.csv"),vcat(header,reduce(vcat,permutedims.(records))),',')
+        writedlm(
+            joinpath(output, "lwp.csv"),
+            vcat(header, reduce(vcat, permutedims.(records))),
+            ',',
+        )
     end
-    add_callback!(simulation,diagnose,TimeInterval(60))
+    add_callback!(simulation, diagnose, TimeInterval(60))
     # Optional NetCDF diagnostics for figures and animation (ATLANTIC_DIAGNOSTICS_SECONDS > 0).
-    every=parse(Float64,get(ENV,"ATLANTIC_DIAGNOSTICS_SECONDS","0"))
-    every>0 && add_callback!(simulation,diagnostics_writer(case,joinpath(output,"diagnostics.nc")),TimeInterval(every))
-    meta["diagnostics_seconds"]=every; meta["radiation_iterations"]=case.radiation_iterations; writemeta()
+    diagnostic_interval=parse(Float64, get(ENV, "ATLANTIC_DIAGNOSTICS_SECONDS", "0"))
+    diagnostic_interval>0 && add_callback!(
+        simulation,
+        diagnostics_writer(case, joinpath(output, "diagnostics.nc")),
+        TimeInterval(diagnostic_interval),
+    )
+    metadata["diagnostics_seconds"]=diagnostic_interval
+    metadata["radiation_iterations"]=case.radiation_iterations
+    writemeta()
     run!(simulation)
     (isempty(records) || last(records)[1]!=model.clock.time) && diagnose(simulation)
-    result=reduce(vcat,permutedims.(records))
-    average(field)=vec(mean(Array(interior(field));dims=(1,2)))
-    theta=average(model.temperature).*(1e5./case.pressure).^0.2857
-    final=hcat(case.z,theta,average(model.microphysical_fields.qᵛ),average(model.velocities.u),average(model.velocities.v))
-    all(isfinite,final) || error("Nonfinite final profile")
-    writedlm(joinpath(output,"final.csv"),vcat(["z_m" "theta_d_K" "qv_kgkg" "u_ms" "v_ms"],final),',')
+    result=reduce(vcat, permutedims.(records))
+    average(field) = vec(mean(Array(interior(field)); dims = (1, 2)))
+    theta=average(model.temperature) .* (1e5 ./ case.pressure) .^ 0.2857
+    final=hcat(
+        case.z,
+        theta,
+        average(model.microphysical_fields.qᵛ),
+        average(model.velocities.u),
+        average(model.velocities.v),
+    )
+    all(isfinite, final) || error("Nonfinite final profile")
+    writedlm(
+        joinpath(output, "final.csv"),
+        vcat(["z_m" "theta_d_K" "qv_kgkg" "u_ms" "v_ms"], final),
+        ',',
+    )
     complete=model.clock.time>=config["duration"]-config["dt"]/2
     if complete
-        terms=observation_loss(input,config,result,final,case.z)
-        meta["loss_terms"]=terms; meta["loss"]=terms["lwp"]+terms["theta"]+terms["qv"]
+        terms=observation_loss(input, config, result, final, case.z)
+        metadata["loss_terms"]=terms
+        metadata["loss"]=terms["lwp"]+terms["theta"]+terms["qv"]
     end
-    meta["complete_interval"]=complete; meta["wall_seconds"]=time()-wall0; meta["final_time"]=model.clock.time
+    metadata["complete_interval"]=complete
+    metadata["wall_seconds"]=time()-start_time
+    metadata["final_time"]=model.clock.time
     writemeta()
-    return meta["loss"]
+    return metadata["loss"]
 end
 
 # Balancing scales (50 g m⁻², 1 K, 1 g kg⁻¹), not observational error bars.
-function observation_loss(input,config,result,final,z)
-    obs=readcsv(joinpath(input,"lwp.csv")); errors=Float64[]
+function observation_loss(input, config, result, final, z)
+    obs=readcsv(joinpath(input, "lwp.csv"))
+    errors=Float64[]
     for row in eachrow(obs)
         row[1]>=config["spinup"] && isfinite(row[3]) || continue
-        select=(result[:,1].>=row[1]).&(result[:,1].<row[2])
-        any(select) && push!(errors,((mean(result[select,2])-row[3])/50)^2)
+        select=(result[:, 1] .>= row[1]) .& (result[:, 1] .< row[2])
+        any(select) && push!(errors, ((mean(result[select, 2])-row[3])/50)^2)
     end
     isempty(errors) && error("No post-spinup valid LWP comparison bins")
-    target=readcsv(joinpath(input,"target.csv")); keep=z.<=2500
-    return Dict("lwp"=>mean(errors),"theta"=>mean((final[keep,2]-target[keep,3]).^2),
-                "qv"=>mean(((final[keep,3]-target[keep,4])./.001).^2))
+    target=readcsv(joinpath(input, "target.csv"))
+    keep=z .<= 2500
+    return Dict(
+        "lwp"=>mean(errors),
+        "theta"=>mean((final[keep, 2]-target[keep, 3]) .^ 2),
+        "qv"=>mean(((final[keep, 3]-target[keep, 4]) ./ 0.001) .^ 2),
+    )
 end

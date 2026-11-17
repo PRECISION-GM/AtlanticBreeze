@@ -18,7 +18,8 @@ using Serialization, Pkg
 input = get(ENV, "ATLANTIC_INPUT", "data/interval")
 output = get(ENV, "ATLANTIC_OUTPUT", "outputs/gradients")
 nx = parse(Int, get(ENV, "ATLANTIC_NX", "16"))
-dx = parse(Float64, get(ENV, "ATLANTIC_DX", "200")); ENV["ATLANTIC_DX"] = string(dx)
+dx = parse(Float64, get(ENV, "ATLANTIC_DX", "200"));
+ENV["ATLANTIC_DX"] = string(dx)
 order = advection_order()
 spinup = parse(Float64, get(ENV, "ATLANTIC_SPINUP_SECONDS", "3600"))
 steps = parse(Int, get(ENV, "ATLANTIC_WINDOW_STEPS", "3"))
@@ -37,15 +38,24 @@ note(msg; kw...) = (@info msg kw...; flush(stderr))
 hz = advection_halo(order)[3]
 if isfile(state_file)
     saved = deserialize(state_file)
-    (saved.nx, saved.dx, saved.order) == (nx, dx, order) || error("State file is for another configuration")
+    (saved.nx, saved.dx, saved.order) == (nx, dx, order) ||
+        error("State file is for another configuration")
 else
-    spin_case = make_case(input; nx, dx, order, architecture=GPU())
-    simulation = Simulation(spin_case.model; Δt=spin_case.config["dt"], stop_time=spinup)
+    spin_case = make_case(input; nx, dx, order, architecture = GPU())
+    simulation = Simulation(spin_case.model; Δt = spin_case.config["dt"], stop_time = spinup)
     add_callback!(simulation, spin_case.refresh!, IterationInterval(1))
     spin = @elapsed run!(simulation)
-    saved = (; nx, dx, order, time=spin_case.model.clock.time, spinup_wall=spin,
-               sst=Array(interior(spin_case.model.radiation.surface_radiation.surface_temperature))[1],
-               fields=Dict(String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(spin_case.model))))
+    saved = (;
+        nx,
+        dx,
+        order,
+        time = spin_case.model.clock.time,
+        spinup_wall = spin,
+        sst = Array(interior(spin_case.model.radiation.surface_radiation.surface_temperature))[1],
+        fields = Dict(
+            String(n) => Array(interior(f)) for (n, f) in pairs(prognostic_fields(spin_case.model))
+        ),
+    )
     serialize(state_file, saved)
 end
 
@@ -53,26 +63,34 @@ end
 # converts the clock to a DateTime, which cannot be traced. Near the spun-up time cos(θz) changes by
 # about 3e-5 per second here (0.007 over 240 s); the forward runs keep the time-varying sun.
 epoch = DateTime(TOML.parsefile(joinpath(input, "interval.toml"))["epoch"])
-cos_zenith = max(Breeze.AtmosphereModels.cos_solar_zenith_angle(
-    Breeze.AtmosphereModels.compute_datetime(saved.time, epoch), ENA_COORDINATE...), 0.0)
+cos_zenith = max(
+    Breeze.AtmosphereModels.cos_solar_zenith_angle(
+        Breeze.AtmosphereModels.compute_datetime(saved.time, epoch),
+        ENA_COORDINATE...,
+    ),
+    0.0,
+)
 solar_position = FixedCosineZenith(cos_zenith)
 # Gas-optics table brackets without a data-dependent loop exit (same brackets as the default binary
 # search), which Reactant needs to raise the radiation kernels.
 lookup_search = NumericalRadiation.FixedBinarySearch()
-native = make_case(input; nx, dx, order, architecture=GPU(), solar_position, lookup_search)
-model = native.model; Nz = length(native.z)
+native = make_case(input; nx, dx, order, architecture = GPU(), solar_position, lookup_search)
+model = native.model;
+Nz = length(native.z)
 
 # Window inputs, all on the architecture of the model they are used with (no host reads while traced).
 function window_inputs(arch)
     on(x) = arch isa ReactantState ? Reactant.to_rarray(x) : on_architecture(arch, x)
     padded(v) = reshape(vcat(zeros(hz), v, zeros(hz)), 1, 1, :, 1)
     keep = native.z .<= TAPER_TOP
-    return (; fields = Dict(n => on(a) for (n, a) in saved.fields),
-              energy_taper = on(padded(native.taper .* limits[1] ./ 86400)),
-              moisture_taper = on(padded(native.taper .* limits[2] ./ (1000 * 86400))),
-              liquid_weights = on(reshape(diff(native.faces) ./ (nx^2 * 0.05), 1, 1, :)),          # LWP / 50 g m⁻²
-              vapor_weights = on(reshape(diff(native.faces) .* keep ./ (nx^2 * 1.0), 1, 1, :)),     # vapor path / 1 kg m⁻²
-              time = saved.time)
+    return (;
+        fields = Dict(n => on(a) for (n, a) in saved.fields),
+        energy_taper = on(padded(native.taper .* limits[1] ./ 86400)),
+        moisture_taper = on(padded(native.taper .* limits[2] ./ (1000 * 86400))),
+        liquid_weights = on(reshape(diff(native.faces) ./ (nx^2 * 0.05), 1, 1, :)),          # LWP / 50 g m⁻²
+        vapor_weights = on(reshape(diff(native.faces) .* keep ./ (nx^2 * 1.0), 1, 1, :)),     # vapor path / 1 kg m⁻²
+        time = saved.time,
+    )
 end
 
 # The correction forcings are the last terms of ρE and ρqᵛ (see make_case).
@@ -98,25 +116,35 @@ function window_objective(model, x, inputs, Δt, steps)
     initialize!(model)
     update_state!(model)
     prepare_first_time_step!(model, Δt)
-    @trace mincut=true checkpointing=true track_numbers=false for step in 1:steps
+    @trace mincut=true checkpointing=true track_numbers=false for step = 1:steps
         time_step!(model, Δt)
     end
     water = model.microphysical_fields
     liquid = interior(water.ρqᶜˡ) .+ interior(water.ρqʳ) .+ interior(water.ρqʷⁱ)
-    return sum(liquid .* inputs.liquid_weights) + sum(interior(model.moisture_density) .* inputs.vapor_weights)
+    return sum(liquid .* inputs.liquid_weights) +
+           sum(interior(model.moisture_density) .* inputs.vapor_weights)
 end
 
 function gradient!(model, dmodel, x, dx, inputs, Δt, steps)
     Enzyme.remake_zero!(dmodel)
     dx .= 0
-    _, J = Enzyme.autodiff(Enzyme.set_strong_zero(Enzyme.ReverseWithPrimal), window_objective, Enzyme.Active,
-                           Enzyme.Duplicated(model, dmodel), Enzyme.Duplicated(x, dx),
-                           Enzyme.Const(inputs), Enzyme.Const(Δt), Enzyme.Const(steps))
+    _, J = Enzyme.autodiff(
+        Enzyme.set_strong_zero(Enzyme.ReverseWithPrimal),
+        window_objective,
+        Enzyme.Active,
+        Enzyme.Duplicated(model, dmodel),
+        Enzyme.Duplicated(x, dx),
+        Enzyme.Const(inputs),
+        Enzyme.Const(Δt),
+        Enzyme.Const(steps),
+    )
     return J, dx
 end
 
 function with_large_stack(f)
-    task = Task(f, 256 * 1024^2); schedule(task); return fetch(task)
+    task = Task(f, 256 * 1024^2)
+    schedule(task)
+    return fetch(task)
 end
 
 Δt = native.config["dt"]
@@ -126,56 +154,126 @@ J(x) = window_objective(model, on_architecture(GPU(), x), inputs, Δt, steps)
 native_seconds = @elapsed J0 = J(zeros(2))
 J0_repeat = J(zeros(2))
 cloud_lwp = 50 * (J0 - sum(Array(interior(model.moisture_density)) .* Array(inputs.vapor_weights)))
-note("native primal"; J0, J0_repeat, cloud_lwp_gm2=cloud_lwp, native_seconds)
-cloud_lwp > 1 || error("Window starts from a nearly cloud-free state (LWP $(cloud_lwp) g/m²); spin up longer")
-fd = [(k, ε, (J([k == 1 ? ε : 0, k == 2 ? ε : 0]) - J([k == 1 ? -ε : 0, k == 2 ? -ε : 0])) / 2ε) for k in 1:2, ε in epsilons]
+note("native primal"; J0, J0_repeat, cloud_lwp_gm2 = cloud_lwp, native_seconds)
+cloud_lwp > 1 ||
+    error("Window starts from a nearly cloud-free state (LWP $(cloud_lwp) g/m²); spin up longer")
+fd = [
+    (k, ε, (J([k == 1 ? ε : 0, k == 2 ? ε : 0]) - J([k == 1 ? -ε : 0, k == 2 ? -ε : 0])) / 2ε)
+    for k = 1:2, ε in epsilons
+]
 
 # Construction runs eager operations on concrete Reactant arrays (e.g. the SAM sponge's initial horizontal
 # average), which index element by element. Scalar access is allowed for construction only; the compiled
 # programs below trace these operations instead.
-note("building Reactant model"; elapsed_s=time() - T0)
-rcase = with_large_stack(() -> CUDA.@allowscalar make_case(input; nx, dx, order, architecture=ReactantState(), solar_position, lookup_search))
+note("building Reactant model"; elapsed_s = time() - T0)
+rcase = with_large_stack(
+    () -> CUDA.@allowscalar make_case(
+        input;
+        nx,
+        dx,
+        order,
+        architecture = ReactantState(),
+        solar_position,
+        lookup_search,
+    )
+)
 rmodel = rcase.model
 set!(rmodel.radiation.surface_radiation.surface_temperature, saved.sst)
 rinputs = window_inputs(ReactantState())
-x = Reactant.to_rarray(zeros(2)); dx_shadow = Reactant.to_rarray(zeros(2))
-options = Reactant.CompileOptions(raise=true, raise_first=true, sync=true, excluded_passes=["concat_insert_dim_elementwise"])
+x = Reactant.to_rarray(zeros(2));
+dx_shadow = Reactant.to_rarray(zeros(2))
+options = Reactant.CompileOptions(
+    raise = true,
+    raise_first = true,
+    sync = true,
+    excluded_passes = ["concat_insert_dim_elementwise"],
+)
 note("compiling primal")
-primal_compile = @elapsed compiled_primal = with_large_stack(() ->
-    Reactant.@compile compile_options=options window_objective(rmodel, x, rinputs, Δt, steps))
+primal_compile = @elapsed compiled_primal = with_large_stack(
+    () -> Reactant.@compile compile_options=options window_objective(rmodel, x, rinputs, Δt, steps)
+)
 Jc = Float64(compiled_primal(rmodel, x, rinputs, Δt, steps))
 parity = abs(Jc - J0) / abs(J0)
 note("compiled primal"; Jc, parity, primal_compile)
 note("compiling reverse gradient")
 dmodel = Enzyme.make_zero(rmodel)
-gradient_compile = @elapsed compiled_gradient = with_large_stack(() ->
-    Reactant.@compile compile_options=options gradient!(rmodel, dmodel, x, dx_shadow, rinputs, Δt, steps))
-gradient_seconds = @elapsed (Jg, g) = compiled_gradient(rmodel, dmodel, x, dx_shadow, rinputs, Δt, steps)
-g = Array(g); Jg = Float64(Jg)
+gradient_compile = @elapsed compiled_gradient = with_large_stack(
+    () -> Reactant.@compile compile_options=options gradient!(
+        rmodel,
+        dmodel,
+        x,
+        dx_shadow,
+        rinputs,
+        Δt,
+        steps,
+    )
+)
+gradient_seconds =
+    @elapsed (Jg, g) = compiled_gradient(rmodel, dmodel, x, dx_shadow, rinputs, Δt, steps)
+g = Array(g);
+Jg = Float64(Jg)
 note("reverse gradient"; Jg, g, gradient_compile, gradient_seconds)
 
 open(joinpath(output, "fd.csv"), "w") do io
     println(io, "control,epsilon,finite_difference,automatic,absolute_error,relative_error")
     for (k, ε, d) in fd
-        println(io, join([k, ε, d, g[k], abs(g[k] - d), abs(g[k] - d) / max(abs(d), abs(g[k]), eps())], ','))
+        println(
+            io,
+            join(
+                [k, ε, d, g[k], abs(g[k] - d), abs(g[k] - d) / max(abs(d), abs(g[k]), eps())],
+                ',',
+            ),
+        )
     end
 end
-best = [minimum(abs(g[k] - d) / max(abs(d), abs(g[k]), eps()) for (kk, ε, d) in fd if kk == k) for k in 1:2]
-version(name) = string(Pkg.dependencies()[findfirst(p -> p.name == name, Pkg.dependencies())].version)
-results = Dict("scope" => "pathwise derivative of a $(steps)-step window from a spun-up state; not the 12 h objective",
-    "nx" => nx, "dx_m" => dx, "domain_m" => nx*dx, "nz" => Nz, "order" => order, "halo" => collect(advection_halo(order)),
-    "closure" => "none", "precision" => "Float64", "aerosol" => "prognostic aer1", "steps" => steps, "dt" => Δt,
-    "radiation_updates_in_window" => 1 + count(n -> n > 0 && n % 30 == 0, 0:steps-1),
+best = [
+    minimum(abs(g[k] - d) / max(abs(d), abs(g[k]), eps()) for (kk, ε, d) in fd if kk == k) for
+    k = 1:2
+]
+version(name) =
+    string(Pkg.dependencies()[findfirst(p -> p.name == name, Pkg.dependencies())].version)
+results = Dict(
+    "scope" => "pathwise derivative of a $(steps)-step window from a spun-up state; not the 12 h objective",
+    "nx" => nx,
+    "dx_m" => dx,
+    "domain_m" => nx*dx,
+    "nz" => Nz,
+    "order" => order,
+    "halo" => collect(advection_halo(order)),
+    "closure" => "none",
+    "precision" => "Float64",
+    "aerosol" => "prognostic aer1",
+    "steps" => steps,
+    "dt" => Δt,
+    "radiation_updates_in_window" => 1 + count(n -> n > 0 && n % 30 == 0, 0:(steps-1)),
     "objective" => "LWP/(50 g m-2) + vapor path below 2.5 km/(1 kg m-2), domain mean, end of window",
     "controls" => "normalized: x1*3 K/day, x2*2 g/kg/day, tapered to zero at 2.5 km",
-    "spunup_time_s" => saved.time, "cos_zenith_fixed" => cos_zenith,
-    "solar_position" => "fixed at window start (traced DateTime unsupported)", "lookup_search" => "FixedBinarySearch", "start_lwp_gm2" => cloud_lwp, "sst_K" => saved.sst,
-    "J_native" => J0, "J_native_repeat" => J0_repeat, "J_compiled" => Jc, "J_gradient_primal" => Jg, "primal_parity" => parity,
-    "gradient" => g, "best_relative_error" => best, "native_window_seconds" => native_seconds,
-    "primal_compile_seconds" => primal_compile, "gradient_compile_seconds" => gradient_compile,
-    "gradient_run_seconds" => gradient_seconds, "max_rss_GB" => Sys.maxrss() / 1e9,
-    "gpu" => CUDA.name(CUDA.device()), "commit" => get(ENV, "ATLANTIC_COMMIT", "unknown"),
-    "versions" => Dict(n => version(n) for n in ("Breeze", "Oceananigans", "Reactant", "Enzyme", "CUDA")))
+    "spunup_time_s" => saved.time,
+    "cos_zenith_fixed" => cos_zenith,
+    "solar_position" => "fixed at window start (traced DateTime unsupported)",
+    "lookup_search" => "FixedBinarySearch",
+    "start_lwp_gm2" => cloud_lwp,
+    "sst_K" => saved.sst,
+    "J_native" => J0,
+    "J_native_repeat" => J0_repeat,
+    "J_compiled" => Jc,
+    "J_gradient_primal" => Jg,
+    "primal_parity" => parity,
+    "gradient" => g,
+    "best_relative_error" => best,
+    "native_window_seconds" => native_seconds,
+    "primal_compile_seconds" => primal_compile,
+    "gradient_compile_seconds" => gradient_compile,
+    "gradient_run_seconds" => gradient_seconds,
+    "max_rss_GB" => Sys.maxrss() / 1e9,
+    "gpu" => CUDA.name(CUDA.device()),
+    "commit" => get(ENV, "ATLANTIC_COMMIT", "unknown"),
+    "versions" =>
+        Dict(n => version(n) for n in ("Breeze", "Oceananigans", "Reactant", "Enzyme", "CUDA")),
+)
 open(io -> TOML.print(io, results), joinpath(output, "gradients.toml"), "w")
 passed = all(isfinite, g) && any(!iszero, g) && parity < 1e-8 && all(best .< 1e-2)
-println(passed ? "GRADIENT_CHECK_PASS" : "GRADIENT_CHECK_NOT_PASSED", " steps=$steps grid=$(nx)x$(nx)x$(Nz) dx=$(dx) order=$(order) best_rel=$(best) parity=$(parity)")
+println(
+    passed ? "GRADIENT_CHECK_PASS" : "GRADIENT_CHECK_NOT_PASSED",
+    " steps=$steps grid=$(nx)x$(nx)x$(Nz) dx=$(dx) order=$(order) best_rel=$(best) parity=$(parity)",
+)

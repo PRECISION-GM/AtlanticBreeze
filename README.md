@@ -4,6 +4,21 @@ Eastern North Atlantic cloud simulations with Breeze, grounded in ARM observatio
 
 The first case is the **March 4, 2016 closed-cell stratocumulus** studied by [Ghate and Cadeddu (2019)](https://doi.org/10.1029/2018JD030141). We collect February 26–March 11 to examine surrounding conditions and select suitable simulation intervals.
 
+## Reading the simulation code
+
+The scripts follow the physical setup used in the Breeze and Oceananigans examples.
+
+- Start with `scripts/forward.jl`: select input/output paths, run the sounding interval, and plot the comparison.
+- `scripts/model.jl` sets up the grid, sounding reference state, microphysics, large-scale forcing,
+  surface fluxes, radiation, dynamics, and initial conditions in that order. Its `forecast` function
+  runs the simulation and writes diagnostics.
+- `scripts/train.jl` contains the original two-control finite-difference optimizer.
+- `scripts/window_gradient.jl` defines the observation-window gradient experiments.
+- `scripts/block_chain.jl` tests differentiation through checkpointed simulation blocks.
+  Its linear test objective is separate from the 90-minute observation loss.
+- The remaining gradient and restart scripts are diagnostic experiments; their completion alone
+  does not establish a validated gradient or trained model.
+
 ## Keep it small
 
 - `cases/march2016.toml`: dates and geographic bounds.

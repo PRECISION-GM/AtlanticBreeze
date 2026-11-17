@@ -97,7 +97,9 @@ lwp_of(m, w) = sum((interior(m.microphysical_fields.ρqᶜˡ) .+ interior(m.micr
 rain_of(m) = view(interior(m.microphysical_fields.ρqʳ), :, size(interior(m.microphysical_fields.ρqʳ), 1) ÷ 2, :)
 function block_core!(m, G, x, inp, Δt)
     set_inputs!(m, x, inp.ci)
-    update_state!(m); prepare_first_time_step!(m, Δt)
+    # Same entry sequence as the validated fresh restart (block_restart_check restore!): initialize!, update_state!,
+    # prepare_first_time_step!, then carried Gⁿ. 17560 P2 split block 1 (no initialize!) differed by 4.9e-3.
+    initialize!(m); update_state!(m); prepare_first_time_step!(m, Δt)
     if is_split(m)   # carried split stage-1 tendencies (17543); useG = 0 in block 1 keeps the derived Gⁿ (its x-dependence differentiated)
         u = sum(inp.useG)
         for (g, gin) in zip(values(Gn(m)), values(G)); parent(g) .= (1 - u) .* parent(g) .+ u .* gin; end
@@ -194,8 +196,9 @@ ci_r = control_inputs(on_r)
 inp_r(b, gL=0.0, gD=zeros(nx, nz)) = (; useG=on_r([b == 1 ? 0.0 : 1.0]), sst=on_r(sst_block(b)), cosz=on_r(cosz_block(b)), stepidx=on_r(collect(1.0:B)),
                                       lwp_weights=on_r(lwp_w), ci=ci_r, gL=on_r([gL]), gD=on_r(gD))
 rG = is_split(rm) ? NamedTuple{keys(Gn(rm))}(Tuple(on_r(zeros(size(parent(g)))) for g in values(Gn(rm)))) : NamedTuple()
-λ0 = (; state=NamedTuple{keys(carried(rm))}(Tuple(on_r(zeros(size(interior(f))))) for f in values(carried(rm))),
-        G=is_split(rm) ? NamedTuple{keys(Gn(rm))}(Tuple(on_r(zeros(size(parent(g))))) for g in values(Gn(rm))) : NamedTuple())
+# (17560: a misplaced parenthesis closed Tuple before the generator, making each λ a tuple of scalars)
+λ0 = (; state=NamedTuple{keys(carried(rm))}(Tuple(on_r(zeros(size(interior(f)))) for f in values(carried(rm)))),
+        G=is_split(rm) ? NamedTuple{keys(Gn(rm))}(Tuple(on_r(zeros(size(parent(g)))) for g in values(Gn(rm)))) : NamedTuple())
 xr = on_r(x0); gx = on_r(zeros(nxc))
 opts = Reactant.CompileOptions(raise=true, raise_first=true, sync=true, excluded_passes=["concat_insert_dim_elementwise"])
 function vjp!(m, dm, G, dG, x, dx, inp, λ, Δt)
@@ -227,7 +230,7 @@ if "P3" in phases
         tv = @elapsed cvjp(rm, dm, rG, dG, xr, gx, inp_r(b, aL[b], aD[b]), λ, dt)
         gtot .+= Array(gx)
         λ = (; state=NamedTuple{keys(carried(rm))}(Tuple(on_r(Array(interior(f))) for f in values(carried(dm)))),
-               G=is_split(rm) ? NamedTuple{keys(dG)}(Tuple(on_r(Array(parent(g)))) for g in values(dG)) : NamedTuple())
+               G=is_split(rm) ? NamedTuple{keys(dG)}(Tuple(on_r(Array(parent(g))) for g in values(dG))) : NamedTuple())
         results["P3_vjp_exec_block$(b)_s"] = tv
     end
     cmp = Dict{String, Any}()

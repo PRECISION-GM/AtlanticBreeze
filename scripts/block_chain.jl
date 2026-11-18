@@ -339,9 +339,26 @@ note("native chain"; J0, carried = results["carried"])
 # schedule — no radiation update at iteration 0, stage 1 — and compare per field with the normal native
 # chain. Tests whether the compiled block-1 mismatch (18199/18304) is the skipped initialization solve.
 if get(ENV, "ATLANTIC_PROBE_RADINIT", "false") == "true"
+    # Only after the window IC is prepared (native_ic! keeps its initialization solve).
+    const TRACED_SCHEDULE = Ref(false)
     @eval Breeze.AtmosphereModels radiation_update_due(schedule, clock, model) =
-        clock.iteration > 0 && clock.stage == 2 && schedule(model)
-    J_traced, traced_checkpoints, traced_records = Base.invokelatest(native_chain, x0)
+        $TRACED_SCHEDULE[] ? (clock.iteration > 0 && clock.stage == 2 && schedule(model)) :
+        ((clock.iteration == 0 && clock.stage == 1) || (clock.iteration > 0 && clock.stage == 2 && schedule(model)))
+    function traced_chain(x)
+        native_ic!(native_model)
+        TRACED_SCHEDULE[] = true
+        ckpt = [snapshot(native_model)]
+        recs = []
+        for b = 1:nb
+            G = NamedTuple{keys(Gn(native_model))}(Tuple(on_n(ckpt[end].G[n]) for n in keys(Gn(native_model))))
+            L, R = block_primal(native_model, G, on_n(x), native_block_inputs(b), dt)
+            push!(recs, (L, Array(R)))
+            push!(ckpt, snapshot(native_model))
+        end
+        TRACED_SCHEDULE[] = false
+        return 0.0, ckpt, recs
+    end
+    J_traced, traced_checkpoints, traced_records = Base.invokelatest(traced_chain, x0)
     for b = 1:nb
         c = compare_checkpoints(traced_checkpoints[b+1], native_checkpoints[b+1])
         results["PROBE_RADINIT_block$(b)"] = Dict("state_worst_rel" => c.worst_state, "tendency_worst_rel" => c.worst_tendency,

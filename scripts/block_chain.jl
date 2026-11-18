@@ -185,6 +185,13 @@ end
 
 function block_core!(m, G, x, inp, Δt)
     set_inputs!(m, x, inp.ci)
+    # Step-1 boundary values before the entry: its update_state! builds the stage-1 tendencies, which the
+    # compiled first step uses directly (the Reactant maybe_prepare is a no-op; natively the iteration-0
+    # repeat inside time_step! hid stale values). 18199/18303: stale cos_zenith/SST at entry gave the
+    # 2e-2 ρnᵃ/ρnᶜˡ block-1 mismatch.
+    first = ifelse.(inp.stepidx .== 1, 1.0, 0.0)
+    parent(surface_temperature(m)) .= sum(inp.sst .* first)
+    cos_zenith_array(m) .= sum(inp.cosz .* first)
     enter_block!(m, Δt)
     if is_split(m)   # carried split stage-1 tendencies (17543); useG = 0 in block 1 keeps the derived Gⁿ (its x-dependence differentiated)
         u = sum(inp.useG)

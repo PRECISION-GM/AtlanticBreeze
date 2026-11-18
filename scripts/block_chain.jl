@@ -32,6 +32,8 @@ B = parse(Int, get(ENV, "ATLANTIC_BLOCK", "60"));
 nb = parse(Int, get(ENV, "ATLANTIC_BLOCKS", "2"))
 phases = split(get(ENV, "ATLANTIC_PHASES", "P1,P2,P3"), ",")
 fields_in = String.(split(get(ENV, "ATLANTIC_INPUT_FIELDS", "T,q,w,ug,vg"), ","))
+G1_MODE = get(ENV, "ATLANTIC_G1", "frozen")
+G1_MODE in ("frozen", "derived") || error("ATLANTIC_G1 must be frozen or derived")
 const INPUT_SCALE =
     Dict("T" => 1 / 86400, "q" => 1e-3 / 86400, "w" => 1e-3, "ug" => 0.1, "vg" => 0.1)
 const INPUT_UNITS =
@@ -185,15 +187,18 @@ end
 
 function block_core!(m, G, x, inp, Δt)
     set_inputs!(m, x, inp.ci)
-    # Step-1 boundary values before the entry: its update_state! builds the stage-1 tendencies, which the
-    # compiled first step uses directly (the Reactant maybe_prepare is a no-op; natively the iteration-0
-    # repeat inside time_step! hid stale values). 18199/18303: stale cos_zenith/SST at entry gave the
-    # 2e-2 ρnᵃ/ρnᶜˡ block-1 mismatch.
+    # Step-1 boundary values before the entry, so its update_state! sees them (the Reactant maybe_prepare
+    # is a no-op). This did not change the block-1 mismatch (18304 bit-identical to 18199); kept as harmless.
     first = ifelse.(inp.stepidx .== 1, 1.0, 0.0)
     parent(surface_temperature(m)) .= sum(inp.sst .* first)
     cos_zenith_array(m) .= sum(inp.cosz .* first)
     enter_block!(m, Δt)
-    if is_split(m)   # carried split stage-1 tendencies (17543); useG = 0 in block 1 keeps the derived Gⁿ (its x-dependence differentiated)
+    # Split: carried stage-1 tendencies (17543). useG = 1 replaces the Gⁿ derived at entry by the carried one.
+    # Block 1: ATLANTIC_G1=frozen (default) carries the native window-start Gⁿ, part of the fixed window IC,
+    # in native and compiled runs alike. ATLANTIC_G1=derived keeps the entry-derived Gⁿ (its input dependence
+    # differentiated), but the compiled derivation depends on non-carried scratch arrays: 18394 reran compiled
+    # block 1 after earlier executions and got 2.05e-2, 9.8e-3, 1.0e-2, while carried-Gⁿ blocks match 3e-12.
+    if is_split(m)
         u = sum(inp.useG)
         for (g, gin) in zip(values(Gn(m)), values(G))
             parent(g) .= (1 - u) .* parent(g) .+ u .* gin
@@ -273,7 +278,7 @@ aD = [randn(rng, nx, nz) ./ (nx * nz) for _ = 1:nb]   # linear test functional
 on_n(a) = on_architecture(GPU(), a)
 native_input_series = control_inputs(on_n)
 native_block_inputs(b, gL = 0.0, gD = zeros(nx, nz)) = (;
-    useG = on_n([b == 1 ? 0.0 : 1.0]),
+    useG = on_n([b == 1 && G1_MODE == "derived" ? 0.0 : 1.0]),
     sst = on_n(sst_block(b)),
     cosz = on_n(cosz_block(b)),
     stepidx = on_n(collect(1.0:B)),
@@ -306,6 +311,7 @@ function native_chain(x; restart = false)
     return J, ckpt, recs
 end
 results = Dict{String,Any}(
+    "block1_Gn" => G1_MODE,
     "nx" => nx,
     "B" => B,
     "nb" => nb,
@@ -501,7 +507,7 @@ results["reactant_build_s"] = build
 on_r(a) = Reactant.to_rarray(a)
 reactant_input_series = control_inputs(on_r)
 reactant_block_inputs(b, gL = 0.0, gD = zeros(nx, nz)) = (;
-    useG = on_r([b == 1 ? 0.0 : 1.0]),
+    useG = on_r([b == 1 && G1_MODE == "derived" ? 0.0 : 1.0]),
     sst = on_r(sst_block(b)),
     cosz = on_r(cosz_block(b)),
     stepidx = on_r(collect(1.0:B)),

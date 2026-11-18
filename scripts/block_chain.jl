@@ -328,6 +328,27 @@ summary_line(c) = "state_worst_rel=$(c.worst_state) Gⁿ_worst_rel=$(c.worst_ten
 x0 = zeros(number_of_controls)
 J0, native_checkpoints, native_records = native_chain(x0)
 note("native chain"; J0, carried = results["carried"])
+# ATLANTIC_PROBE_ITER0=true (split, native only): repeat the native chain with the iteration-0 repeat of
+# `prepare_acoustic_first_time_step!` inside `time_step!` suppressed (the Reactant method is a no-op), and
+# compare per field with the normal native chain. Overwrites the generic method for this process only.
+if get(ENV, "ATLANTIC_PROBE_ITER0", "false") == "true" && is_split(native_model)
+    @eval Breeze.TimeSteppers function OceananigansTimeSteppers.maybe_prepare_first_time_step!(model::CompressibleAcousticModel, Δt, callbacks)
+        isfinite(model.clock.last_stage_Δt) || prepare_acoustic_first_time_step!(model, Δt, callbacks)
+        return nothing
+    end
+    J_single, single_checkpoints, single_records = Base.invokelatest(native_chain, x0)
+    for b = 1:nb
+        c = compare_checkpoints(single_checkpoints[b+1], native_checkpoints[b+1])
+        results["PROBE_ITER0_block$(b)"] = Dict("state_worst_rel" => c.worst_state, "tendency_worst_rel" => c.worst_tendency,
+            "lwp_rel" => abs(single_records[b][1] - native_records[b][1]) / abs(native_records[b][1]),
+            "state_by_field" => c.state_differences, "tendency_by_field" => c.tendency_differences)
+        println("PROBE_ITER0 block $b single-prepare vs native: ", summary_line(c))
+    end
+    results["PROBE_ITER0_J"] = (J_single, J0)
+    save()
+    println("PROBE_ITER0_DONE")
+    exit()
+end
 if "P1" in phases
     # Same native model reloaded from its own checkpoints: tests checkpoint/load completeness, not a
     # fresh-model restart (that evidence is block_restart_check.jl with ATLANTIC_FRESH=true).

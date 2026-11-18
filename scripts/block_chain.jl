@@ -335,6 +335,27 @@ summary_line(c) = "state_worst_rel=$(c.worst_state) Gⁿ_worst_rel=$(c.worst_ten
 x0 = zeros(number_of_controls)
 J0, native_checkpoints, native_records = native_chain(x0)
 note("native chain"; J0, carried = results["carried"])
+# ATLANTIC_PROBE_RADINIT=true (native only): rerun the native chain with the traced (Reactant) radiation
+# schedule — no radiation update at iteration 0, stage 1 — and compare per field with the normal native
+# chain. Tests whether the compiled block-1 mismatch (18199/18304) is the skipped initialization solve.
+if get(ENV, "ATLANTIC_PROBE_RADINIT", "false") == "true"
+    @eval Breeze.AtmosphereModels radiation_update_due(schedule, clock, model) =
+        clock.iteration > 0 && clock.stage == 2 && schedule(model)
+    J_traced, traced_checkpoints, traced_records = Base.invokelatest(native_chain, x0)
+    for b = 1:nb
+        c = compare_checkpoints(traced_checkpoints[b+1], native_checkpoints[b+1])
+        results["PROBE_RADINIT_block$(b)"] = Dict("state_worst_rel" => c.worst_state, "tendency_worst_rel" => c.worst_tendency,
+            "lwp_rel" => abs(traced_records[b][1] - native_records[b][1]) / abs(native_records[b][1]),
+            "state_by_field" => c.state_differences, "tendency_by_field" => c.tendency_differences)
+        println("PROBE_RADINIT block $b traced-schedule vs native: ", summary_line(c))
+        for (k, v) in sort(collect(merge(c.state_differences, Dict("Gⁿ " * k => v for (k, v) in c.tendency_differences))); by = last, rev = true)[1:8]
+            println("  ", rpad(k, 40), " ", v)
+        end
+    end
+    save()
+    println("PROBE_RADINIT_DONE")
+    exit()
+end
 # ATLANTIC_PROBE_FRESH1=true (native only): load the block-1 checkpoint (carried state only) into a FRESH
 # native model, enter block 1 as block_core! does, and list every storage array that differs from the
 # native chain's model at the same point; then run block 1 and compare with the native block-1 checkpoint.

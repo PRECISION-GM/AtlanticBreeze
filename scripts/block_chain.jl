@@ -328,6 +328,73 @@ summary_line(c) = "state_worst_rel=$(c.worst_state) Gⁿ_worst_rel=$(c.worst_ten
 x0 = zeros(number_of_controls)
 J0, native_checkpoints, native_records = native_chain(x0)
 note("native chain"; J0, carried = results["carried"])
+# ATLANTIC_PROBE_FRESH1=true (native only): load the block-1 checkpoint (carried state only) into a FRESH
+# native model, enter block 1 as block_core! does, and list every storage array that differs from the
+# native chain's model at the same point; then run block 1 and compare with the native block-1 checkpoint.
+# Tests whether the compiled block-1 mismatch (18199: ρnᵃ, ρnᶜˡ) is state the checkpoint does not carry.
+function array_leaves!(out, x, path, seen, depth)
+    depth > 12 && return out
+    if x isa Union{Array{<:Number},CUDA.CuArray{<:Number}}
+        out[path] = x
+        return out
+    end
+    (isbitstype(typeof(x)) || x isa Union{Module,Function,DataType,String,Symbol} ||
+     x isa Oceananigans.Grids.AbstractGrid) && return out
+    id = objectid(x)
+    id in seen && return out
+    push!(seen, id)
+    if x isa Union{Tuple,NamedTuple}
+        for (k, v) in pairs(x)
+            array_leaves!(out, v, "$path[$k]", seen, depth + 1)
+        end
+    else
+        for f in fieldnames(typeof(x))
+            isdefined(x, f) && array_leaves!(out, getfield(x, f), "$path.$f", seen, depth + 1)
+        end
+    end
+    return out
+end
+function differing_arrays(a, b)
+    out = Dict{String,Float64}()
+    for (k, x) in a
+        haskey(b, k) && size(b[k]) == size(x) || continue
+        y = b[k]
+        d = maximum(abs.(Array(x) .- Array(y)); init = 0.0) / max(maximum(abs.(Array(y)); init = 0.0), eps())
+        (d > 1e-14 || isnan(d)) && (out[k] = d)
+    end
+    return out
+end
+if get(ENV, "ATLANTIC_PROBE_FRESH1", "false") == "true"
+    raw(m) = Dict(k => Array(v) for (k, v) in array_leaves!(Dict{String,Any}(), m, "model", Set{UInt}(), 0))
+    inputs1 = native_block_inputs(1)
+    G1 = is_split(native_model) ? NamedTuple{keys(Gn(native_model))}(Tuple(on_n(native_checkpoints[1].G[n]) for n in keys(Gn(native_model)))) : NamedTuple()
+    native_ic!(native_model)
+    before_native = raw(native_model)
+    set_inputs!(native_model, on_n(x0), inputs1.ci); enter_block!(native_model, dt)
+    entered_native = raw(native_model)
+    fresh = make(GPU()).model
+    load!(fresh, native_checkpoints[1], put_native!)
+    before_fresh = raw(fresh)
+    set_inputs!(fresh, on_n(x0), inputs1.ci); enter_block!(fresh, dt)
+    entered_fresh = raw(fresh)
+    for (label, a, b) in (("before_entry", before_fresh, before_native), ("after_entry", entered_fresh, entered_native))
+        d = differing_arrays(a, b)
+        results["PROBE_FRESH1_$(label)"] = d
+        println("PROBE_FRESH1 $label: $(length(d)) arrays differ")
+        for (k, v) in sort(collect(d); by = last, rev = true)[1:min(end, 60)]
+            println("  ", rpad(k, 90), " ", v)
+        end
+    end
+    fresh2 = make(GPU()).model
+    load!(fresh2, native_checkpoints[1], put_native!)
+    block_primal(fresh2, G1, on_n(x0), native_block_inputs(1), dt)
+    c = compare_checkpoints(snapshot(fresh2), native_checkpoints[2])
+    results["PROBE_FRESH1_block1"] = Dict("state_by_field" => c.state_differences, "tendency_by_field" => c.tendency_differences)
+    println("PROBE_FRESH1 block 1 fresh-loaded vs native: ", summary_line(c))
+    save()
+    println("PROBE_FRESH1_DONE")
+    exit()
+end
 # ATLANTIC_PROBE_ITER0=true (split, native only): repeat the native chain with the iteration-0 repeat of
 # `prepare_acoustic_first_time_step!` inside `time_step!` suppressed (the Reactant method is a no-op), and
 # compare per field with the normal native chain. Overwrites the generic method for this process only.
@@ -344,7 +411,7 @@ if get(ENV, "ATLANTIC_PROBE_ITER0", "false") == "true" && is_split(native_model)
             "state_by_field" => c.state_differences, "tendency_by_field" => c.tendency_differences)
         println("PROBE_ITER0 block $b single-prepare vs native: ", summary_line(c))
     end
-    results["PROBE_ITER0_J"] = (J_single, J0)
+    results["PROBE_ITER0_J"] = [J_single, J0]
     save()
     println("PROBE_ITER0_DONE")
     exit()

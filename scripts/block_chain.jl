@@ -564,7 +564,14 @@ if "P2" in phases
     results["primal_compile_s"] = pc
     save()
     note("compiled block primal"; pc)
-    for b = 1:nb
+    # ATLANTIC_P2_ORDER (e.g. "1,1,2"): blocks in execution order; a repeated block is stored as
+    # P2_block<b>_run<k>. Repeating block 1 after a first execution tests whether the compiled cold-start
+    # mismatch depends on scratch (non-carried) arrays left by construction rather than on the checkpoint.
+    p2_order = parse.(Int, split(get(ENV, "ATLANTIC_P2_ORDER", join(1:nb, ",")), ","))
+    p2_seen = Dict{Int,Int}()
+    for b in p2_order
+        p2_seen[b] = get(p2_seen, b, 0) + 1
+        p2_key = p2_seen[b] == 1 ? "P2_block$(b)" : "P2_block$(b)_run$(p2_seen[b])"
         load!(reactant_model, native_checkpoints[b], put_r!)
         is_split(reactant_model) && foreach(
             n -> put_r!(reactant_tendencies[n], native_checkpoints[b].G[n]),
@@ -582,7 +589,7 @@ if "P2" in phases
             maximum(abs.(Array(R) .- native_records[b][2])) /
             max(maximum(abs.(native_records[b][2])), eps())
         comparison = compare_checkpoints(snapshot(reactant_model), native_checkpoints[b+1])
-        results["P2_block$(b)"] = Dict(
+        results[p2_key] = Dict(
             "lwp_rel" => rel,
             "rain_rel" => relR,
             "state_worst_rel" => comparison.worst_state,
@@ -593,7 +600,7 @@ if "P2" in phases
             "exec_s" => tb,
         )
         save()
-        println("PHASE P2 block $b compiled vs native (reloaded checkpoint): lwp_rel=$rel rain_rel=$relR ",
+        println("PHASE P2 $p2_key compiled vs native (reloaded checkpoint): lwp_rel=$rel rain_rel=$relR ",
                 summary_line(comparison), " exec_s=$tb")
     end
 
